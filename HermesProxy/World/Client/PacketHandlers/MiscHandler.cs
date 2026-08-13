@@ -28,6 +28,20 @@ public partial class WorldClient
         SendPacketToClient(tutorials);
     }
 
+    // Legacy 3.3.5a sends this immediately after world authentication.  It is
+    // a uint32 on both sides, but it still needs an explicit handler so the
+    // modern opcode is emitted instead of dropping the packet.  The packet can
+    // arrive before the BNet -> Realm handoff completes; WorldClient queues it
+    // until RealmSocket is available.
+    [PacketHandler(Opcode.SMSG_CACHE_VERSION)]
+    void HandleCacheVersion(WorldPacket packet)
+    {
+        SendPacketToClient(new ClientCacheVersion
+        {
+            CacheVersion = packet.ReadUInt32()
+        });
+    }
+
     [PacketHandler(Opcode.SMSG_ACCOUNT_DATA_TIMES)]
     void HandleAccountDataTimes(WorldPacket packet)
     {
