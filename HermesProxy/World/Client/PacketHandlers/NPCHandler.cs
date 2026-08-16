@@ -78,9 +78,27 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_BINDER_CONFIRM)]
     void HandleBinderConfirm(WorldPacket packet)
     {
-        BinderConfirm confirm = new BinderConfirm();
-        confirm.Guid = packet.ReadGuid().To128(GetSession().GameState);
-        GetSession().GameState.CurrentInteractedWithNPC = confirm.Guid;
+        WowGuid128 guid = packet.ReadGuid().To128(GetSession().GameState);
+        GetSession().GameState.CurrentInteractedWithNPC = guid;
+
+        // Wrath Classic 3.4.3 removed SMSG_BINDER_CONFIRM and opens the binder dialog via the
+        // generic NPC interaction result packet instead. Preserve the old packet for client builds
+        // that still map it, and use the verified 3.4.3 wire packet only when the old opcode is absent.
+        if (ModernVersion.GetCurrentOpcode(Opcode.SMSG_BINDER_CONFIRM) == 0)
+        {
+            BinderInteractionOpenResult343 interaction = new BinderInteractionOpenResult343
+            {
+                Guid = guid,
+                Success = true,
+            };
+            SendPacketToClient(interaction);
+            return;
+        }
+
+        BinderConfirm confirm = new BinderConfirm
+        {
+            Guid = guid,
+        };
         SendPacketToClient(confirm);
     }
 
@@ -193,7 +211,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_TRAINER_BUY_FAILED)]
     void HandleTrainerBuyFailed(WorldPacket packet)
     {
-        TrainerBuyFailed buy = new();
+        TrainerBuyFailed buy = new TrainerBuyFailed();
         buy.TrainerGUID = packet.ReadGuid().To128(GetSession().GameState);
         buy.SpellID = packet.ReadUInt32();
         buy.TrainerFailedReason = packet.ReadUInt32();
@@ -205,7 +223,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.MSG_TALENT_WIPE_CONFIRM)]
     void HandleTalentWipeConfirm(WorldPacket packet)
     {
-        RespecWipeConfirm respec = new();
+        RespecWipeConfirm respec = new RespecWipeConfirm();
         respec.TrainerGUID = packet.ReadGuid().To128(GetSession().GameState);
         respec.Cost = packet.ReadUInt32();
         SendPacketToClient(respec);
