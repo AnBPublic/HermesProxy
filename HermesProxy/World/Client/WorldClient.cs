@@ -617,7 +617,12 @@ public partial class WorldClient
                 GetSession().RealmSocket.SendAuthWaitQue(_queuePosition);
             }
             _isSuccessful = true;
-            StartKeepAliveTimer();
+            // W2: 3.4.3 already supplies CMSG_PING packets which Hermes forwards
+            // to the 3.3.5a backend. Do not add a second 30-second ping stream.
+            if (LegacyVersion.Build < ClientVersionBuild.V3_3_5a_12340)
+                StartKeepAliveTimer();
+            else
+                Log.Print(LogType.Network, "W2: synthetic legacy keepalive disabled for WotLK; forwarding modern client CMSG_PING only.");
         }
         else if (result == AuthResult.AUTH_WAIT_QUEUE)
         {
