@@ -187,6 +187,10 @@ public abstract class ServerPacket
 
 public class WorldPacket : ByteBuffer
 {
+    // Internal-only universal dispatch value for 3.4.3 talent preview. This deliberately sits
+    // outside the generated Opcode enum's normal range; it never goes on the wire.
+    public const uint WotLK343LearnPreviewTalentsDispatch = 0xFFFFF001u;
+
     public WorldPacket(uint opcode = 0)
     {
         this.opcode = opcode;
@@ -351,17 +355,12 @@ public class WorldPacket : ByteBuffer
     {
         if (isModern)
         {
-            // Wrath Classic 3.4.3 build 54261 uses these preview-talent client opcodes, but the
-            // generated version table in this fork only maps the single-talent opcode. Normalize
-            // them here so the regular universal-opcode dispatcher can reach the compatibility
-            // handlers without changing generated opcode data.
-            if (ModernVersion.GetCurrentOpcode(Opcode.CMSG_LEARN_TALENT) == 0x3552)
-            {
-                if (GetOpcode() == 0x3553)
-                    return Opcode.CMSG_LEARN_PREVIEW_TALENTS;
-                if (GetOpcode() == 0x3555)
-                    return Opcode.CMSG_LEARN_PREVIEW_TALENTS_PET;
-            }
+            // Wrath Classic 3.4.3.54261 uses 0x3553 for the player preview batch, while this
+            // fork's generated 3.4.3 opcode table leaves that operation unnamed. Normalize only
+            // that exact client family into an internal dispatcher value. Pet preview remains
+            // untouched until its bridge path is independently implemented and live-tested.
+            if (ModernVersion.GetCurrentOpcode(Opcode.CMSG_LEARN_TALENT) == 0x3552 && GetOpcode() == 0x3553)
+                return (Opcode)WotLK343LearnPreviewTalentsDispatch;
 
             return ModernVersion.GetUniversalOpcode(GetOpcode());
         }
