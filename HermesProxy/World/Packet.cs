@@ -350,7 +350,21 @@ public class WorldPacket : ByteBuffer
     public Opcode GetUniversalOpcode(bool isModern)
     {
         if (isModern)
+        {
+            // Wrath Classic 3.4.3 build 54261 uses these preview-talent client opcodes, but the
+            // generated version table in this fork only maps the single-talent opcode. Normalize
+            // them here so the regular universal-opcode dispatcher can reach the compatibility
+            // handlers without changing generated opcode data.
+            if (ModernVersion.GetCurrentOpcode(Opcode.CMSG_LEARN_TALENT) == 0x3552)
+            {
+                if (GetOpcode() == 0x3553)
+                    return Opcode.CMSG_LEARN_PREVIEW_TALENTS;
+                if (GetOpcode() == 0x3555)
+                    return Opcode.CMSG_LEARN_PREVIEW_TALENTS_PET;
+            }
+
             return ModernVersion.GetUniversalOpcode(GetOpcode());
+        }
         else
             return LegacyVersion.GetUniversalOpcode(GetOpcode());
     }
