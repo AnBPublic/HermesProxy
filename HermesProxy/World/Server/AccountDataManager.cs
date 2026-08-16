@@ -295,7 +295,7 @@ public class AccountDataManager
                     }
 
                     int delayMs = 25 * attempt;
-                    Log.Print(LogType.Warning, $"[AccountData] Transient file lock while saving '{fileName}'; retry {attempt}/{maxAttempts} in {delayMs} ms: {ex.Message}");
+                    Log.Print(LogType.Error, $"[AccountData] Transient file lock while saving '{fileName}'; retry {attempt}/{maxAttempts} in {delayMs} ms: {ex.Message}");
                     Thread.Sleep(delayMs);
                 }
             }
