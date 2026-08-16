@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Framework;
 using Framework.Logging;
@@ -155,6 +156,9 @@ public class AccountData
 }
 public class AccountDataManager
 {
+    // W2: serialize account-data persistence and tolerate transient file locks.
+    private static readonly object AccountDataFileSaveLock = new();
+
     public AccountData[] Data = null!;
     string _accountName;
     string _realmName;
@@ -249,24 +253,52 @@ public class AccountDataManager
     {
         if (compressedData == null)
             return;
-        if (Data[type] == null)
-            Data[type] = new();
 
-        Data[type].Guid = guid;
-        Data[type].Timestamp = timestamp;
-        Data[type].Type = type;
-        Data[type].UncompressedSize = uncompressedSize;
-        Data[type].CompressedData = compressedData;
-
-        using (BinaryWriter writer = new BinaryWriter(File.Open(GetFullFileName(guid, type), FileMode.Create)))
+        lock (AccountDataFileSaveLock)
         {
-            writer.Write(guid.GetLowValue());
-            writer.Write(guid.GetHighValue());
-            writer.Write(timestamp);
-            writer.Write(type);
-            writer.Write(uncompressedSize);
-            writer.Write(compressedData.Length);
-            writer.Write(compressedData);
+            if (Data[type] == null)
+                Data[type] = new();
+
+            Data[type].Guid = guid;
+            Data[type].Timestamp = timestamp;
+            Data[type].Type = type;
+            Data[type].UncompressedSize = uncompressedSize;
+            Data[type].CompressedData = compressedData;
+
+            string fileName = GetFullFileName(guid, type);
+            const int maxAttempts = 8;
+
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    using FileStream stream = new(fileName, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    using BinaryWriter writer = new(stream);
+
+                    writer.Write(guid.GetLowValue());
+                    writer.Write(guid.GetHighValue());
+                    writer.Write(timestamp);
+                    writer.Write(type);
+                    writer.Write(uncompressedSize);
+                    writer.Write(compressedData.Length);
+                    writer.Write(compressedData);
+                    writer.Flush();
+                    stream.Flush(true);
+                    return;
+                }
+                catch (IOException ex)
+                {
+                    if (attempt == maxAttempts)
+                    {
+                        Log.Print(LogType.Error, $"[AccountData] Could not persist '{fileName}' after {maxAttempts} attempts; keeping in-memory state and continuing: {ex.Message}");
+                        return;
+                    }
+
+                    int delayMs = 25 * attempt;
+                    Log.Print(LogType.Warning, $"[AccountData] Transient file lock while saving '{fileName}'; retry {attempt}/{maxAttempts} in {delayMs} ms: {ex.Message}");
+                    Thread.Sleep(delayMs);
+                }
+            }
         }
     }
 
