@@ -65,11 +65,10 @@ dotnet run --config appsettings.json --LoggingOptions:PacketLevel=Debug --metric
 ## Git/Change-Safety Rules
 
 - **master branch** tracks upstream with AnBPublic-specific additions
-- **feature/wotlk-classic-v3.4.3** contains phased WotLK support (do not merge prematurely)
-- **Perf branches** (perf/union-*) are optimization workstreams
-- **fix/ branches** are targeted bug fixes
 - Do **not** force-push to master
 - Rebase feature work on current master before PR
+
+**Never infer current server/client compatibility status from AGENTS.md. Read the canonical WotLK compatibility/status documentation (`wotlk.md`) and latest validation evidence.**
 
 ## Things an Agent MUST NOT Do
 
@@ -90,7 +89,6 @@ dotnet run --config appsettings.json --LoggingOptions:PacketLevel=Debug --metric
 
 - **Static:** `dotnet build`, `dotnet test`, configuration parsing
 - **Live:** Actual client connection, packet capture analysis, end-to-end gameplay
-- **WotLK 3.4.3:** Currently **static only** — no live validation claimed
 - Always distinguish: "builds and tests pass" vs "verified in-game"
 
 ## Related Repositories

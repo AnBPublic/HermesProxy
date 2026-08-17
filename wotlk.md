@@ -9,6 +9,28 @@ As of 2026-04-22 the fork has been checked out with its **full 46-commit git his
 
 ---
 
+## Live Validation Evidence
+
+### MAELSTROM / MILLENNIUM (CMaNGOS-based)
+- Wrath Classic client 3.4.3.54261 has successfully connected through the bridge to the 3.3.5a target.
+- Character login works.
+- World entry works.
+- Gameplay/movement works.
+- A gameplay session exceeding approximately 15 minutes was observed without the recurring ChromieCraft disconnect.
+
+### CHROMIECRAFT
+- Authentication/login works.
+- Character selection works.
+- World entry works.
+- Gameplay/movement begins successfully.
+- Connection currently drops after approximately 60-90 seconds.
+- **Status: PARTIAL LIVE COMPATIBILITY, not complete compatibility.**
+
+### WARMANE / LORDAERON
+- Do not claim support, implementation or validation unless repository evidence demonstrates it.
+
+---
+
 ## Why this is a large effort: 3.4.3 uses a new ObjectUpdate format
 
 Per-version investigation of upstream vs. fork `ObjectUpdateBuilder.cs`:
