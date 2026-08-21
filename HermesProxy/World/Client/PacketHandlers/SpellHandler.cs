@@ -1,12 +1,10 @@
 ﻿using Framework;
-using Framework.Logging;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
-using HermesProxy.World.Objects;
+using Framework.Logging;
 using HermesProxy.World.Server.Packets;
 using System;
 using System.Collections.Generic;
-using System.Collections.Immutable;
 using System.Linq;
 
 namespace HermesProxy.World.Client;
@@ -18,10 +16,7 @@ public partial class WorldClient
     void HandleSendKnownSpells(WorldPacket packet)
     {
         SendKnownSpells spells = new SendKnownSpells();
-        bool legacyInitialLogin = packet.ReadBool();
-        spells.InitialLogin = ModernVersion.Build == ClientVersionBuild.V3_4_3_54261
-            ? GetSession().GameState.IsFirstEnterWorld
-            : legacyInitialLogin;
+        spells.InitialLogin = packet.ReadBool();
         ushort spellCount = packet.ReadUInt16();
         for (ushort i = 0; i < spellCount; i++)
         {
@@ -270,12 +265,9 @@ public partial class WorldClient
         SendPacketToClient(failed);
     }
 
-    // Both SMSG_SPELL_FAILURE (own cast failed) and SMSG_SPELL_FAILED_OTHER share the
-    // same legacy wire layout (PackedGuid caster, [u8 castCount], u32 spellId, u8 reason).
-    // The proxy emits both modern packets unconditionally so the V3_4_3 client gets the
-    // failure for either path — without this, SMSG_SPELL_FAILURE was being silently
-    // dropped, leaving the client's cast-state UI hung waiting for a never-arriving
-    // success/fail and accumulating in the suspect window for `reason=7` disconnects.
+    // SMSG_SPELL_FAILURE (own cast) and SMSG_SPELL_FAILED_OTHER share the same
+    // legacy wire layout. A failed own cast is terminal: remove it from the
+    // pending queue so HasStartedNormalCast() cannot keep the client cast state alive.
     [PacketHandler(Opcode.SMSG_SPELL_FAILURE)]
     [PacketHandler(Opcode.SMSG_SPELL_FAILED_OTHER)]
     void HandleSpellFailedOther(WorldPacket packet)
@@ -296,12 +288,12 @@ public partial class WorldClient
 
         WowGuid128 castId;
         uint spellVisual;
-        // Try to find pending cast info (peek, don't remove - this is informational).
         // Match by either modern SpellId or LegacySpellId for SoM-renumbered items.
-        if (GetSession().GameState.CurrentPlayerGuid == casterUnit &&
-            GetSession().GameState.PendingNormalCasts.FirstOrDefault(c => c.SpellId == spellId || (c.LegacySpellId != 0 && c.LegacySpellId == spellId)) is { } pendingNormal)
+        // Own failures are terminal and must dequeue the cast; other-unit failures
+        // only use the pending queue as a lookup for the outbound cast identity.
+        if (GetSession().GameState.TryDequeueOwnPendingNormalCast(casterUnit, spellId, out var pendingNormal))
         {
-            castId = pendingNormal.ServerGUID;
+            castId = pendingNormal!.ServerGUID;
             spellVisual = pendingNormal.SpellXSpellVisualId;
             if (pendingNormal.LegacySpellId != 0)
                 spellId = pendingNormal.SpellId;
@@ -313,6 +305,13 @@ public partial class WorldClient
             spellVisual = pendingPet.SpellXSpellVisualId;
             if (pendingPet.LegacySpellId != 0)
                 spellId = pendingPet.SpellId;
+        }
+        else if (GetSession().GameState.CurrentPlayerGuid == casterUnit)
+        {
+            // The server may send both own and other-caster failure packets for one
+            // cancellation. The first packet already terminated the tracked cast;
+            // do not resurrect it with a synthetic failure on the paired packet.
+            return;
         }
         else
         {
@@ -404,11 +403,6 @@ public partial class WorldClient
 
         SpellGo spell = new SpellGo();
         spell.Cast = HandleSpellStartOrGo(packet, true);
-
-        // 3.3.5a SpellGo doesn't set HasTrajectory but the V3_4_3 client requires it
-        // on SpellGo (not SpellStart) to render projectile/missile visuals.
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
-            spell.Cast.CastFlags |= (uint)CastFlag.HasTrajectory;
 
         // Dequeue completed cast (queue-based, FIFO order)
         if (GetSession().GameState.CurrentPlayerGuid == spell.Cast.CasterUnit &&
@@ -589,77 +583,19 @@ public partial class WorldClient
 
             if (flags.HasAnyFlag(CastFlag.RuneInfo))
             {
-                // Legacy 3.3.5 wire: u8 rechargingMask (= pre-cast usable mask, normally 0x3F),
-                // u8 usableMask (= post-cast usable mask), then one u8 cooldown byte per rune
-                // consumed by THIS cast (i.e. set in rechargingMask AND cleared in usableMask).
-                // Cooldown byte semantics match V3_4_3: 255 = ready, 0 = full cooldown.
-                var rechargingMask = packet.ReadUInt8();
-                var usableMask = packet.ReadUInt8();
+                var spellRuneState = packet.ReadUInt8();
+                var playerRuneState = packet.ReadUInt8();
 
-                var runeStateCache = GetSession().GameState.RuneState;
-                Span<byte> consumed = stackalloc byte[RuneStateData.MaxRunes];
-                for (var i = 0; i < RuneStateData.MaxRunes; i++)
+                for (var i = 0; i < 6; i++)
                 {
-                    var bit = 1 << i;
-                    if ((bit & rechargingMask) == 0)
+                    var mask = 1 << i;
+                    if ((mask & spellRuneState) == 0)
                         continue;
-                    if ((bit & usableMask) != 0)
+
+                    if ((mask & playerRuneState) != 0)
                         continue;
-                    consumed[i] = packet.ReadUInt8();
-                }
 
-                if (runeStateCache != null)
-                {
-                    // Sync the cached RuneState so the next CREATE (zone change / mount)
-                    // reflects the latest state, and emit a V3_4_3-shaped RemainingRunes
-                    // (per CypherCore native sniff): Start always 0x3F, Count = post-cast
-                    // usable mask, full 6-byte Cooldowns snapshot.
-                    for (int i = 0; i < RuneStateData.MaxRunes; i++)
-                    {
-                        var bit = 1 << i;
-                        if ((bit & usableMask) != 0)
-                            runeStateCache.Cooldowns[i] = 255;
-                        else if ((bit & rechargingMask) != 0)
-                            runeStateCache.Cooldowns[i] = consumed[i];
-                        // else: leave alone — already on cooldown from an earlier cast.
-                    }
-
-                    var runes = new RuneData
-                    {
-                        Start = (byte)((1 << RuneStateData.MaxRunes) - 1),
-                        Count = usableMask,
-                    };
-                    for (int i = 0; i < RuneStateData.MaxRunes; i++)
-                        runes.Cooldowns.Add(runeStateCache.Cooldowns[i]);
-                    dbdata.RemainingRunes = runes;
-
-                    // Per CypherCore native sniff: V3_4_3 SpellGo carries RemainingPower
-                    // entries for each rune type consumed by the cast (Cost=0, Type=RuneXxx)
-                    // PLUS a Type=RunicPower entry with the post-cast runic-power value.
-                    // The client appears to use the bundled RemainingPower entries as the
-                    // trigger to render the per-rune cooldown swirl; without them the rune
-                    // frame stays visually idle even though RemainingRunes carries the cooldown bytes.
-                    bool anyRuneEntryAdded = false;
-                    for (int i = 0; i < RuneStateData.MaxRunes; i++)
-                    {
-                        var bit = 1 << i;
-                        if ((bit & rechargingMask) == 0 || (bit & usableMask) != 0)
-                            continue;
-                        // Rune i was consumed by THIS cast. Map base type -> PowerType.
-                        var pt = RuneTypeToPowerType(runeStateCache.RuneTypes[i]);
-                        if (pt == PowerType.Invalid)
-                            continue;
-                        dbdata.RemainingPower.Add(new SpellPowerData { Cost = 0, Type = pt });
-                        anyRuneEntryAdded = true;
-                    }
-                    if (anyRuneEntryAdded)
-                    {
-                        dbdata.RemainingPower.Add(new SpellPowerData
-                        {
-                            Cost = runeStateCache.LastRunicPower,
-                            Type = PowerType.RunicPower,
-                        });
-                    }
+                    packet.ReadUInt8(); // Rune Cooldown Passed
                 }
             }
 
@@ -833,46 +769,29 @@ public partial class WorldClient
         bool debugOutput = packet.ReadBool();
         if (debugOutput)
         {
-            // The debug-float block (flags-gated diagnostic fields, not consumed by the
-            // modern client) is wrapped because TC 3.4.3 sometimes ships debugOutput=1
-            // without the matching trailing floats — read overshoots end-of-buffer and
-            // throws ArgumentOutOfRangeException out of ByteBuffer.ReadFloat, killing
-            // the WorldClient receive loop and disconnecting the user mid-combat
-            // (observed in hermes-20260510_220015.log:84606 after ~21 min of combat).
-            // Swallowing the truncation is strictly better than dropping the connection;
-            // the spell.Damage / SchoolMask / etc. fields we already read are sufficient
-            // for the modern client to render the combat log entry.
-            try
+            if (!spell.Flags.HasAnyFlag(SpellHitType.Split))
             {
-                if (!spell.Flags.HasAnyFlag(SpellHitType.Split))
+                if (spell.Flags.HasAnyFlag(SpellHitType.CritDebug))
                 {
-                    if (spell.Flags.HasAnyFlag(SpellHitType.CritDebug))
-                    {
-                        packet.ReadFloat(); // roll
-                        packet.ReadFloat(); // needed
-                    }
-
-                    if (spell.Flags.HasAnyFlag(SpellHitType.HitDebug))
-                    {
-                        packet.ReadFloat(); // roll
-                        packet.ReadFloat(); // needed
-                    }
-
-                    if (spell.Flags.HasAnyFlag(SpellHitType.AttackTableDebug))
-                    {
-                        packet.ReadFloat(); // miss chance
-                        packet.ReadFloat(); // dodge chance
-                        packet.ReadFloat(); // parry chance
-                        packet.ReadFloat(); // block chance
-                        packet.ReadFloat(); // glance chance
-                        packet.ReadFloat(); // crush chance
-                    }
+                    packet.ReadFloat(); // roll
+                    packet.ReadFloat(); // needed
                 }
-            }
-            catch (Exception ex) when (ex is ArgumentOutOfRangeException || ex is System.IO.EndOfStreamException)
-            {
-                Log.Print(LogType.Warn,
-                    $"[SpellNonMeleeDamageLog] truncated debug block — flags=0x{(uint)spell.Flags:X} damage={spell.Damage} (recovered, packet shipped to client): {ex.Message}");
+
+                if (spell.Flags.HasAnyFlag(SpellHitType.HitDebug))
+                {
+                    packet.ReadFloat(); // roll
+                    packet.ReadFloat(); // needed
+                }
+
+                if (spell.Flags.HasAnyFlag(SpellHitType.AttackTableDebug))
+                {
+                    packet.ReadFloat(); // miss chance
+                    packet.ReadFloat(); // dodge chance
+                    packet.ReadFloat(); // parry chance
+                    packet.ReadFloat(); // block chance
+                    packet.ReadFloat(); // glance chance
+                    packet.ReadFloat(); // crush chance
+                }
             }
         }
 
@@ -1007,6 +926,72 @@ public partial class WorldClient
         SendPacketToClient(spell);
     }
 
+    [PacketHandler(Opcode.SMSG_SPELL_EXECUTE_LOG)]
+    void HandleSpellExecuteLog(WorldPacket packet)
+    {
+        SpellExecuteLog spell = new();
+        spell.CasterGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        spell.SpellID = packet.ReadUInt32();
+        uint effectCount = packet.ReadUInt32();
+
+        if (effectCount > 64)
+        {
+            Log.Print(LogType.Network, $"[SpellExecuteLog] Ignoring malformed effect count {effectCount}.");
+            return;
+        }
+
+        for (uint i = 0; i < effectCount; i++)
+        {
+            var effect = new SpellExecuteLogEffect { Effect = packet.ReadUInt32() };
+            switch ((SpellExecuteLogEffectType)effect.Effect)
+            {
+                case SpellExecuteLogEffectType.PowerDrain:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    effect.Amount = packet.ReadUInt32();
+                    effect.PowerType = packet.ReadUInt32();
+                    effect.GainMultiplier = packet.ReadFloat();
+                    break;
+                case SpellExecuteLogEffectType.AddExtraAttacks:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    effect.Count = packet.ReadUInt32();
+                    break;
+                case SpellExecuteLogEffectType.InterruptCast:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    effect.SpellID = packet.ReadUInt32();
+                    break;
+                case SpellExecuteLogEffectType.DurabilityDamage:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    effect.ItemID = packet.ReadInt32();
+                    effect.Slot = packet.ReadInt32();
+                    break;
+                case SpellExecuteLogEffectType.OpenLock:
+                case SpellExecuteLogEffectType.OpenLockItem:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    break;
+                case SpellExecuteLogEffectType.CreateItem:
+                    effect.Entry = packet.ReadUInt32();
+                    break;
+                case SpellExecuteLogEffectType.Summon:
+                case SpellExecuteLogEffectType.TransDoor:
+                case SpellExecuteLogEffectType.SummonPet:
+                case SpellExecuteLogEffectType.SummonObjectWild:
+                case SpellExecuteLogEffectType.CreateHouse:
+                case SpellExecuteLogEffectType.Duel:
+                case SpellExecuteLogEffectType.SummonObjectSlot1:
+                case SpellExecuteLogEffectType.SummonObjectSlot2:
+                case SpellExecuteLogEffectType.SummonObjectSlot3:
+                case SpellExecuteLogEffectType.SummonObjectSlot4:
+                case SpellExecuteLogEffectType.FeedPet:
+                case SpellExecuteLogEffectType.DismissPet:
+                    effect.TargetGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+                    break;
+            }
+            spell.Effects.Add(effect);
+        }
+
+        SendPacketToClient(spell);
+    }
+
     [PacketHandler(Opcode.SMSG_SPELL_DELAYED)]
     void HandleSpellDelayed(WorldPacket packet)
     {
@@ -1020,7 +1005,7 @@ public partial class WorldClient
     }
 
     [PacketHandler(Opcode.MSG_CHANNEL_START)]
-    void HandleSpellChannelStart(WorldPacket packet)
+    void HandleMsgChannelStart(WorldPacket packet)
     {
         SpellChannelStart channel = new();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
@@ -1034,7 +1019,33 @@ public partial class WorldClient
     }
 
     [PacketHandler(Opcode.MSG_CHANNEL_UPDATE)]
-    void HandleSpellChannelUpdate(WorldPacket packet)
+    void HandleMsgChannelUpdate(WorldPacket packet)
+    {
+        SpellChannelUpdate channel = new();
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+            channel.CasterGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        else
+            channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
+        channel.TimeRemaining = packet.ReadInt32();
+        SendPacketToClient(channel);
+    }
+
+    [PacketHandler(Opcode.SMSG_SPELL_CHANNEL_START)]
+    void HandleSmsgSpellChannelStart(WorldPacket packet)
+    {
+        SpellChannelStart channel = new();
+        if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
+            channel.CasterGUID = packet.ReadPackedGuid().To128(GetSession().GameState);
+        else
+            channel.CasterGUID = GetSession().GameState.CurrentPlayerGuid;
+        channel.SpellID = packet.ReadUInt32();
+        channel.SpellXSpellVisualID = GameData.GetSpellVisual(channel.SpellID);
+        channel.Duration = packet.ReadUInt32();
+        SendPacketToClient(channel);
+    }
+
+    [PacketHandler(Opcode.SMSG_SPELL_CHANNEL_UPDATE)]
+    void HandleSmsgSpellChannelUpdate(WorldPacket packet)
     {
         SpellChannelUpdate channel = new();
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
@@ -1259,310 +1270,6 @@ public partial class WorldClient
         packet.ReadPackedGuid(); // target guid
     }
 
-    // FIXME(phase5a-auras): stub. Forwards an empty modern AuraUpdate ONLY for the
-    // player's own GUID — that single packet is what V3_4_3's loading screen waits
-    // for after the player CreateObject. Legacy 3.3.5a sends one of these for every
-    // nearby unit on world-entry; forwarding all of them floods the client and
-    // triggers an auto-disconnect, so we drop the rest until full translation lands.
-    // Existing buffs/debuffs on the player are also invisible until the full parse.
-    // Replace with a slot-by-slot parse:
-    //   while (packet.CanRead()) {
-    //       slot = packet.ReadUInt8();
-    //       flags = packet.ReadUInt8();
-    //       if (flags == 0) emit empty aura at slot;
-    //       else { spellId, level, charges, optional caster guid, optional duration } -> AuraInfo
-    //   }
-    // SMSG_AURA_UPDATE_ALL (one shot for all auras on a unit) — loop ReadSingleAura
-    // until the packet is exhausted. SMSG_AURA_UPDATE (single update) — one read.
-    // Ported from HermesProxy-WOTLK fork's WorldClient.HandleAuraUpdate*. The prior
-    // stub-handler discarded all aura entries; the V3_4_3 client tolerates an empty
-    // single-update but a multi-update with combat auras stripped causes a state
-    // divergence (SMSG_ATTACK_START + empty AURA_UPDATE_ALL on the player) that
-    // produces an immediate `CMSG_LOG_DISCONNECT reason=7` — observed in
-    // hermes-20260501_004716.log line 1395.
-    [PacketHandler(Opcode.SMSG_AURA_UPDATE)]
-    [PacketHandler(Opcode.SMSG_AURA_UPDATE_ALL)]
-    void HandleAuraUpdate(WorldPacket packet)
-    {
-        bool isAll = packet.GetUniversalOpcode(false) == Opcode.SMSG_AURA_UPDATE_ALL;
-        uint incomingBytes = packet.GetSize();
-        WowGuid128 guid = packet.ReadPackedGuid().To128(GetSession().GameState);
-        bool isPlayer = guid == GetSession().GameState.CurrentPlayerGuid;
-
-        AuraUpdate update = new AuraUpdate(guid, isAll);
-
-        if (isAll)
-        {
-            while (packet.CanRead())
-                ReadSingleAura(packet, guid, update);
-        }
-        else
-        {
-            ReadSingleAura(packet, guid, update);
-        }
-
-        // Track live aura state per unit so the post-CreateObject deferred-flush can
-        // re-emit the player's actual auras (V3_4_3 client drops aura updates that
-        // arrive before its CreateObject for the unit). For UpdateAll=True we replace
-        // the unit's slot table; for UpdateAll=False we patch individual slots.
-        var knownAuras = GetSession().GameState.KnownAuras;
-        if (!knownAuras.TryGetValue(guid, out var slotMap))
-        {
-            slotMap = new Dictionary<byte, AuraInfo>();
-            knownAuras[guid] = slotMap;
-        }
-
-        // Dedup: skip the outbound send when an isAll resync is byte-identical to what
-        // the client already has (modulo monotonic duration ticks, which the client
-        // counts down locally). In dense scripted events (e.g. DK quest 12800 Light's
-        // Hope battle) the legacy server bursts ~9 SMSG_AURA_UPDATE_ALL/sec per nearby
-        // unit, almost all of which are no-op refreshes. Forwarding every one
-        // accumulates client-side allocations and contributes to mid-session
-        // CMSG_LOG_DISCONNECT(reason=7). KnownAuras is still kept in sync below — we
-        // only suppress the wire send.
-        bool dedupHit = isAll && update.Auras.Count == slotMap.Count
-                              && update.Auras.Count > 0
-                              && AllAurasEquivalent(update.Auras, slotMap);
-
-        if (isAll)
-            slotMap.Clear();
-        foreach (var aura in update.Auras)
-        {
-            if (aura.AuraData == null)
-                slotMap.Remove(aura.Slot);
-            else
-                slotMap[aura.Slot] = aura;
-        }
-
-        Log.Print(LogType.Trace,
-            $"[AuraUpdateTrace] guid={guid} isAll={isAll} isPlayer={isPlayer} " +
-            $"incomingBytes={incomingBytes} aurasShipped={update.Auras.Count} trackedTotal={slotMap.Count} dedupHit={dedupHit}");
-
-        if (dedupHit)
-        {
-            Log.Print(LogType.Trace, $"[AuraDedup] skipped no-op resync guid={guid} slots={update.Auras.Count}");
-            return;
-        }
-
-        if (update.Auras.Count > 0)
-            SendPacketToClient(update);
-    }
-
-    // Whole-list equality for AURA_UPDATE_ALL dedup. Returns true iff every incoming
-    // slot has a cached counterpart that is equal under AuraDataInfo's compiler-
-    // synthesized record-class Equals (which deliberately excludes Duration / Remaining /
-    // TimeMod tick fields — those are plain instance fields, not auto-properties, and
-    // records skip non-property fields). Slot sets must match exactly (caller checks
-    // count first).
-    private static bool AllAurasEquivalent(List<AuraInfo> incoming, Dictionary<byte, AuraInfo> cached)
-    {
-        foreach (var aura in incoming)
-        {
-            if (!cached.TryGetValue(aura.Slot, out var prev))
-                return false;
-            if (aura.AuraData != prev.AuraData)  // record-class auto-Equals
-                return false;
-        }
-        return true;
-    }
-
-    void ReadSingleAura(WorldPacket packet, WowGuid128 guid, AuraUpdate update)
-    {
-        byte slot = packet.ReadUInt8();
-        uint spellId = packet.ReadUInt32();
-
-        AuraInfo aura = new AuraInfo { Slot = slot };
-
-        if (spellId == 0)
-        {
-            // Aura removed — modern packet ships AuraData=null in this slot.
-            aura.AuraData = null!;
-            update.Auras.Add(aura);
-            return;
-        }
-
-        AuraDataInfo data = new AuraDataInfo
-        {
-            SpellID = spellId,
-            CastID = WowGuid128.Create(HighGuidType703.Cast, SpellCastSource.Aura,
-                                       (uint)(GetSession().GameState.CurrentMapId ?? 0u),
-                                       spellId, guid.GetCounter()),
-            SpellXSpellVisualID = GameData.GetSpellVisual(spellId),
-        };
-
-        var legacyFlags = (AuraFlagsWotLK)packet.ReadUInt8();
-        data.CastLevel = packet.ReadUInt8();
-        data.Applications = packet.ReadUInt8();
-
-        data.Flags = AuraFlagsModern.None;
-        data.ActiveFlags = 0u;
-
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.Positive)) data.Flags |= AuraFlagsModern.Positive;
-        // Negative (harmful) bit must be forwarded: the modern client categorizes the aura
-        // as a debuff from this flag and applies the stat-penalty visual (red character-sheet
-        // numbers, e.g. Resurrection Sickness -%stat). Without it the icon shows (debuff
-        // border comes from spell DB2) but the stat reduction never renders red. Native 3.4.3
-        // ships Flags=21 (NoCaster|Duration|Negative) for 15007; dropping Negative gave 5.
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.Negative)) data.Flags |= AuraFlagsModern.Negative;
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.Duration)) data.Flags |= AuraFlagsModern.Duration;
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.NoCaster)) data.Flags |= AuraFlagsModern.NoCaster;
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex0)) data.ActiveFlags |= 1u;
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex1)) data.ActiveFlags |= 2u;
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex2)) data.ActiveFlags |= 4u;
-
-        data.CastUnit = legacyFlags.HasAnyFlag(AuraFlagsWotLK.NoCaster)
-            ? guid
-            : packet.ReadPackedGuid().To128(GetSession().GameState);
-
-        // Cancelable: V3_4_3 client requires this flag for right-click-buff and the
-        // CancelShapeshiftForm() Lua path (i.e. `/cancelform`, stance-bar toggle, and
-        // direct buff right-click) to emit CMSG_CANCEL_AURA. Legacy 3.3.5a doesn't carry
-        // a Cancelable bit on the wire — the client decides locally from spell attributes.
-        // TC wotlk_classic gates AFLAG_CANCELABLE on caster==target (self-cast only), but
-        // that's narrower than legacy 3.3.5a semantics: the player can right-click cancel
-        // any positive non-passive buff on themselves regardless of who cast it (PWS from
-        // a priest, Mark of the Wild from a druid, etc.). Gate purely on "positive aura
-        // landing on the local player" — broader than TC, matches legacy client behavior.
-        bool isPositive = legacyFlags.HasAnyFlag(AuraFlagsWotLK.Positive);
-        bool isOnLocalPlayer = guid == GetSession().GameState.CurrentPlayerGuid;
-        if (isPositive && isOnLocalPlayer)
-            data.Flags |= AuraFlagsModern.Cancelable;
-
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.Duration))
-        {
-            data.Duration = packet.ReadInt32();
-            data.Remaining = packet.ReadInt32();
-        }
-
-        if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.Scalable))
-        {
-            var points = ImmutableArray.CreateBuilder<float>(3);
-            if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex0)) points.Add(packet.ReadFloat());
-            if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex1)) points.Add(packet.ReadFloat());
-            if (legacyFlags.HasAnyFlag(AuraFlagsWotLK.EffectIndex2)) points.Add(packet.ReadFloat());
-            data.Points = points.ToImmutable();
-        }
-
-        aura.AuraData = data;
-        update.Auras.Add(aura);
-    }
-
-    // Legacy 3.3.5a SMSG_HEALTH_UPDATE wire format: PackedGuid + uint32 health.
-    // Modern V3_4_3 expects: PackedGuid128 + int64 health.
-    [PacketHandler(Opcode.SMSG_HEALTH_UPDATE)]
-    void HandleHealthUpdate(WorldPacket packet)
-    {
-        WowGuid128 guid = packet.ReadPackedGuid().To128(GetSession().GameState);
-        uint health = packet.ReadUInt32();
-
-        HealthUpdate update = new HealthUpdate(guid)
-        {
-            Health = health,
-        };
-        SendPacketToClient(update);
-        Log.Print(LogType.Trace, $"[HealthUpdateTrace] guid={guid} health={health}");
-    }
-
-    // Legacy 3.3.5a SMSG_POWER_UPDATE wire format: PackedGuid + uint8 powerType + uint32 power.
-    // Modern V3_4_3 expects: PackedGuid128 + int32 count + (int32 power, uint8 type)*.
-    // The `type` byte is forwarded as-is — the V3_4_3 client interprets it as the
-    // global PowerType enum, same as legacy (verified in HermesProxy-WOTLK fork
-    // WorldClient.cs:5500-5510 which works for warrior rage).
-    [PacketHandler(Opcode.SMSG_POWER_UPDATE)]
-    void HandlePowerUpdate(WorldPacket packet)
-    {
-        WowGuid128 guid = packet.ReadPackedGuid().To128(GetSession().GameState);
-        byte powerType = packet.ReadUInt8();
-        int power = (int)packet.ReadUInt32();
-
-        PowerUpdate update = new PowerUpdate(guid);
-        update.Powers.Add(new PowerUpdatePower(power, powerType));
-        SendPacketToClient(update);
-        Log.Print(LogType.Trace, $"[PowerUpdateTrace] guid={guid} type={(PowerType)powerType} power={power}");
-
-        // Cache RunicPower for the local player so SpellGo can embed a RemainingPower
-        // entry with the post-cast value (V3_4_3 wire shape — see CastFlag.RuneInfo branch).
-        var runeState = GetSession().GameState.RuneState;
-        if (runeState != null && (PowerType)powerType == PowerType.RunicPower &&
-            guid == GetSession().GameState.CurrentPlayerGuid)
-        {
-            runeState.LastRunicPower = power;
-        }
-    }
-
-    // V3_4_3 DK rune-state legacy handlers. Older modern targets (V1_14 / V2_5) pre-date
-    // Death Knights and never allocate RuneState, so the null-guard makes these no-ops.
-    // None of these forward to the V3_4_3 client — TC fires the rune opcodes thousands of
-    // times per session (especially RESYNC_RUNES with constantly-decaying cooldown values),
-    // and forwarding overwhelmed the client (observed: WoW #132 ACCESS_VIOLATION crash).
-    // SpellGo's embedded RemainingRunes carries the per-cast snapshot, and the V3_4_3
-    // client manages the visual cooldown swirl from that snapshot — that's the dominant
-    // path. We only mutate the cached RuneState here so the next CREATE block reflects
-    // authoritative state on zone change / mount.
-
-    [PacketHandler(Opcode.SMSG_RESYNC_RUNES)]
-    void HandleResyncRunes(WorldPacket packet)
-    {
-        var runeState = GetSession().GameState.RuneState;
-        if (runeState == null)
-            return;
-
-        // TC 3.3.5 wire: u32 count (always MAX_RUNES, payload is junk on some builds);
-        // for i in 0..count { u8 type; u8 cooldown }.
-        packet.ReadUInt32();
-        for (int i = 0; i < RuneStateData.MaxRunes; i++)
-        {
-            runeState.RuneTypes[i] = packet.ReadUInt8();
-            runeState.Cooldowns[i] = packet.ReadUInt8();
-        }
-    }
-
-    [PacketHandler(Opcode.SMSG_CONVERT_RUNE)]
-    void HandleConvertRune(WorldPacket packet)
-    {
-        var runeState = GetSession().GameState.RuneState;
-        if (runeState == null)
-            return;
-
-        byte index = packet.ReadUInt8();
-        byte newType = packet.ReadUInt8();
-        if (index < RuneStateData.MaxRunes)
-            runeState.RuneTypes[index] = newType;
-    }
-
-    [PacketHandler(Opcode.SMSG_ADD_RUNE_POWER)]
-    void HandleAddRunePower(WorldPacket packet)
-    {
-        var runeState = GetSession().GameState.RuneState;
-        if (runeState == null)
-            return;
-
-        // u32 mask of rune slots that just refreshed (cooldown -> ready, byte 255).
-        uint mask = packet.ReadUInt32();
-        for (int i = 0; i < RuneStateData.MaxRunes; i++)
-        {
-            if ((mask & (1u << i)) != 0)
-                runeState.Cooldowns[i] = 255;
-        }
-    }
-
-    // Map TC's per-slot rune type byte (Blood=0, Unholy=1, Frost=2, Death=3) to
-    // the V3_4_3 per-rune-type power slot the client uses for cooldown animation.
-    // Death runes are temporary conversions; the client tracks them by slot, so we
-    // fall back to PowerType.Invalid (caller skips emitting an entry — the rune
-    // visual will lag for one cycle until the slot reverts to its base type).
-    private static PowerType RuneTypeToPowerType(byte runeType)
-    {
-        return runeType switch
-        {
-            0 => PowerType.RuneBlood,
-            1 => PowerType.RuneUnholy,
-            2 => PowerType.RuneFrost,
-            _ => PowerType.Invalid,
-        };
-    }
-
-
     [PacketHandler(Opcode.SMSG_RESURRECT_REQUEST)]
     void HandleResurrectRequest(WorldPacket packet)
     {
@@ -1612,6 +1319,40 @@ public partial class WorldClient
             GetSession().GameState.SetFlatSpellMod(modIndex, classIndex, modValue);
         else
             GetSession().GameState.SetPctSpellMod(modIndex, classIndex, modValue);
+    }
+
+    [PacketHandler(Opcode.SMSG_CANCEL_SPELL_VISUAL)]
+    void HandleCancelSpellVisual(WorldPacket packet)
+    {
+        CancelSpellVisual cancel = new CancelSpellVisual();
+        cancel.Unit = packet.ReadPackedGuid().To128(GetSession().GameState);
+
+        // Try to read spell visual ID if present
+        if (packet.CanRead())
+            cancel.SpellVisualID = packet.ReadUInt32();
+
+        // Try to read the HasKit bit if present
+        if (packet.CanRead())
+            cancel.HasKit = packet.ReadBit();
+
+        SendPacketToClient(cancel);
+    }
+
+    [PacketHandler(Opcode.SMSG_CANCEL_SPELL_VISUAL_KIT)]
+    void HandleCancelSpellVisualKit(WorldPacket packet)
+    {
+        CancelSpellVisualKit cancel = new CancelSpellVisualKit();
+        cancel.Unit = packet.ReadPackedGuid().To128(GetSession().GameState);
+
+        // Try to read spell visual ID if present
+        if (packet.CanRead())
+            cancel.SpellVisualID = packet.ReadUInt32();
+
+        // Try to read the HasKit bit if present
+        if (packet.CanRead())
+            cancel.HasKit = packet.ReadBit();
+
+        SendPacketToClient(cancel);
     }
 
     /// <summary>

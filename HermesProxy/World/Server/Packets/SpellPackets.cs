@@ -2297,6 +2297,64 @@ class PlaySpellVisualKit : ServerPacket, ISpanWritable
     public bool MountedVisual = false;
 }
 
+class CancelSpellVisual : ServerPacket, ISpanWritable
+{
+    public CancelSpellVisual() : base(Opcode.SMSG_CANCEL_SPELL_VISUAL) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(Unit);
+        _worldPacket.WriteUInt32(SpellVisualID);
+        _worldPacket.WriteBit(HasKit);
+        _worldPacket.FlushBits();
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 5; // GUID + uint + 1 bit
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(Unit.Low, Unit.High);
+        writer.WriteUInt32(SpellVisualID);
+        writer.WriteBit(HasKit);
+        writer.FlushBits();
+        return writer.Position;
+    }
+
+    public WowGuid128 Unit;
+    public uint SpellVisualID;
+    public bool HasKit;
+}
+
+class CancelSpellVisualKit : ServerPacket, ISpanWritable
+{
+    public CancelSpellVisualKit() : base(Opcode.SMSG_CANCEL_SPELL_VISUAL_KIT) { }
+
+    public override void Write()
+    {
+        _worldPacket.WritePackedGuid128(Unit);
+        _worldPacket.WriteUInt32(SpellVisualID);
+        _worldPacket.WriteBit(HasKit);
+        _worldPacket.FlushBits();
+    }
+
+    public int MaxSize => PackedGuidHelper.MaxPackedGuid128Size + 5; // GUID + uint + 1 bit
+
+    public int WriteToSpan(Span<byte> buffer)
+    {
+        var writer = new SpanPacketWriter(buffer);
+        writer.WritePackedGuid128(Unit.Low, Unit.High);
+        writer.WriteUInt32(SpellVisualID);
+        writer.WriteBit(HasKit);
+        writer.FlushBits();
+        return writer.Position;
+    }
+
+    public WowGuid128 Unit;
+    public uint SpellVisualID;
+    public bool HasKit;
+}
+
 class ResurrectRequest : ServerPacket, ISpanWritable
 {
     public ResurrectRequest() : base(Opcode.SMSG_RESURRECT_REQUEST) { }
