@@ -2,6 +2,7 @@
 
 using Framework.GameMath;
 using Framework.Logging;
+using Framework.Util;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -70,77 +71,24 @@ public partial class WorldClient
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.Values, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, false);
                     PowerUpdate powerUpdate = new PowerUpdate(guid);
-                    ReadValuesUpdateBlock(packet, ref guid, updateData, auraUpdate, powerUpdate, i);
-
-                    // Trace per-Values-update so we can correlate legacy-side reads with
-                    // the modern-side WriteValuesUpdate output. We log:
-                    // - legacy GUID type (Transport, MOTransport, ItemContainer, GameObject,
-                    //   Player, Unit, etc.) and its 32-bit "entry/counter" — explains why
-                    //   client may never have a CreateObject for repeating guids
-                    // - which modern descriptor sections have ANY concrete field set (a
-                    //   non-empty delta is what would actually transmit data)
-                    bool isPlayer = guid == GetSession().GameState.CurrentPlayerGuid;
-                    var valuesLegacyHigh = oldGuid.GetHighGuidTypeLegacy();
-                    uint legacyEntry = oldGuid.GetEntry();
-                    ulong legacyCounter = oldGuid.GetCounter();
-                    var u = updateData.UnitData;
-                    var o = updateData.ObjectData;
-                    var p = updateData.PlayerData;
-                    var a = updateData.ActivePlayerData;
-                    bool unitHasAnyField = u != null && (
-                        u.Health.HasValue || u.MaxHealth.HasValue || u.DisplayID.HasValue ||
-                        u.Level.HasValue || u.Flags.HasValue || u.AuraState.HasValue ||
-                        u.Charm != null || u.Summon != null || u.Target != null ||
-                        u.Power != null || u.MaxPower != null || u.Stats != null);
-                    bool playerHasAnyField = p != null && (
-                        p.PlayerFlags.HasValue || p.NativeSex.HasValue ||
-                        p.GuildRankID.HasValue || p.HonorLevel.HasValue ||
-                        p.DuelArbiter != null || p.WowAccount != null);
-                    bool activeHasAnyField = a != null && (
-                        a.Coinage.HasValue || a.XP.HasValue || a.NextLevelXP.HasValue ||
-                        ActivePlayerHasAnySlot(a));
-
-                    static bool ActivePlayerHasAnySlot(ActivePlayerData a)
-                    {
-                        if (a.InvSlots != null)
-                            for (int i = 0; i < a.InvSlots.Length; i++)
-                                if (a.InvSlots[i] != null) return true;
-                        if (a.PackSlots != null)
-                            for (int i = 0; i < a.PackSlots.Length; i++)
-                                if (a.PackSlots[i] != null) return true;
-                        if (a.BankSlots != null)
-                            for (int i = 0; i < a.BankSlots.Length; i++)
-                                if (a.BankSlots[i] != null) return true;
-                        if (a.BankBagSlots != null)
-                            for (int i = 0; i < a.BankBagSlots.Length; i++)
-                                if (a.BankBagSlots[i] != null) return true;
-                        if (a.BuyBackSlots != null)
-                            for (int i = 0; i < a.BuyBackSlots.Length; i++)
-                                if (a.BuyBackSlots[i] != null) return true;
-                        if (a.KeyringSlots != null)
-                            for (int i = 0; i < a.KeyringSlots.Length; i++)
-                                if (a.KeyringSlots[i] != null) return true;
-                        return false;
-                    }
-
-                    Log.Print(LogType.Trace,
-                        $"[UpdateValuesTrace][in] i={i} guid={guid} legacyHigh={valuesLegacyHigh} legacyEntry={legacyEntry} legacyCounter={legacyCounter} " +
-                        $"isPlayer={isPlayer} " +
-                        $"hasObj={(o != null && (o.EntryID.HasValue || o.DynamicFlags.HasValue || o.Scale.HasValue))} " +
-                        $"hasUnit={u != null} unitAnyField={unitHasAnyField} hp={u?.Health} maxHp={u?.MaxHealth} flags=0x{(u?.Flags ?? 0):X} " +
-                        $"hasPlayer={p != null} playerAnyField={playerHasAnyField} " +
-                        $"hasActive={a != null} activeAnyField={activeHasAnyField} " +
-                        $"auras={auraUpdate.Auras.Count} powers={powerUpdate.Powers.Count}");
+                    ReadValuesUpdateBlock(packet, guid, updateData, auraUpdate, powerUpdate, i);
 
                     if (powerUpdate.Powers.Count != 0)
                         SendPacketToClient(powerUpdate);
 
-                    // ItemContainer (cmangos's non-standard 0x4700 high-guid for equipped/
-                    // container items) Values updates flow through unchanged. The matching
-                    // CreateObject for these guids is already forwarded (see CreateObject1/2
-                    // branches below), so the V3_4_3 client has the item object to bind to.
-                    // The HighGuid mapping (ItemContainer → Item, HighGuid.cs:30) ensures
-                    // To128() produces a normal Item-typed guid.
+                    // Transport/MOTransport remains gated until its placeholder position layout
+                    // is validated against a 3.4.3 capture. GameObject and ItemContainer Values
+                    // are now emitted through the partial-update serializer.
+                    if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
+                    {
+                        var legacyHigh = oldGuid.GetHighGuidTypeLegacy();
+                        if (legacyHigh == HighGuidTypeLegacy.Transport ||
+                            legacyHigh == HighGuidTypeLegacy.MOTransport)
+                        {
+                            Log.Print(LogType.Network, $"[Phase5aTrace] Skipping Values for Transport guid={guid}.");
+                            break;
+                        }
+                    }
 
                     updateObject.ObjectUpdates.Add(updateData);
                     if (auraUpdate.Auras.Count != 0)
@@ -186,19 +134,7 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject1, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
-                    ReadCreateObjectBlock(packet, ref guid, updateData, auraUpdate, i);
-
-                    TraceNpcBotCreateObject("CreateObject1", oldGuid, guid, updateData);
-
-                    // The TC reference parse (CypherCoreClassicWOTLK World_login_parsed.txt
-                    // packet #140) sends the player as CreateObject1, not CreateObject2 —
-                    // the player is part of the first 15-object UPDATE_OBJECT batch and
-                    // arrives as a fresh CreateObject1 with ThisIsYou=true. Forwarding
-                    // cmangos's CreateObject1 verbatim matches that wire pattern; no
-                    // promotion to CreateObject2 here. (Earlier in this port we promoted
-                    // to CreateObject2; the audit against the live TC capture proved
-                    // CreateObject1 is correct, and the canary-trigger sensitivity is
-                    // tied to first-creation type.)
+                    ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (updateData.Guid == GetSession().GameState.CurrentPlayerGuid)
                         GetSession().GameState.CurrentPlayerStorage.CompletedQuests.WriteAllCompletedIntoArray(updateData.ActivePlayerData.QuestCompleted);
@@ -211,35 +147,18 @@ public partial class WorldClient
 
                     if (updateData.CreateData.MoveInfo != null || !guid.IsWorldObject() )
                     {
-                        // V3_4_3-only filter: cMangos sends Transport/MOTransport
-                        // CreateObjects with Position=(0,0,0) (legacy server defers
-                        // position to subsequent update-field deltas; TC/AC use
-                        // spawn-data position). The V3_4_3 client rejects a Stationary
-                        // GameObject create with Position=(0,0,0) and Orientation!=0
-                        // with CMSG_OBJECT_UPDATE_FAILED, looping forever. Static
-                        // GameObjects forward fine. ItemContainer (0x4700) is also
-                        // forwarded (HighGuid mapping converts to a normal Item guid).
+                        // Transport/MOTransport remains gated until its placeholder position layout
+                        // is validated against a 3.4.3 capture. GameObject and ItemContainer create
+                        // blocks are now forwarded through the verified create serializers.
                         bool filtered = false;
                         if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
                         {
                             var legacyHigh = oldGuid.GetHighGuidTypeLegacy();
                             if (legacyHigh == HighGuidTypeLegacy.Transport ||
-                                legacyHigh == HighGuidTypeLegacy.MOTransport)
+                                     legacyHigh == HighGuidTypeLegacy.MOTransport)
                             {
-                                Log.Print(LogType.Trace,
-                                    $"Skipping {legacyHigh} for V3_4_3 (Position=0 placeholder; pending MOTransport position fix) guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"}.");
+                                Log.Print(LogType.Network, $"[Phase5aTrace] Skipping Transport create1 guid={guid} (placeholder position pending capture validation).");
                                 filtered = true;
-                            }
-                            else if (legacyHigh == HighGuidTypeLegacy.GameObject)
-                            {
-                                var rot = updateData.CreateData?.MoveInfo?.Rotation;
-                                Log.Print(LogType.Trace,
-                                    $"Forwarding CreateObject1 for {legacyHigh} guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"} typeID={updateData.GameObjectData?.TypeID?.ToString() ?? "null"} state={updateData.GameObjectData?.State?.ToString() ?? "null"} rot=({rot?.X.ToString("F3") ?? "?"},{rot?.Y.ToString("F3") ?? "?"},{rot?.Z.ToString("F3") ?? "?"},{rot?.W.ToString("F3") ?? "?"}).");
-                            }
-                            else if (legacyHigh == HighGuidTypeLegacy.ItemContainer)
-                            {
-                                Log.Print(LogType.Trace,
-                                    $"[ItemContainerTrace] Forwarding CreateObject1 for 0x4700 ItemContainer guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"}.");
                             }
                         }
 
@@ -268,9 +187,7 @@ public partial class WorldClient
 
                     ObjectUpdate updateData = new ObjectUpdate(guid, UpdateTypeModern.CreateObject2, GetSession());
                     AuraUpdate auraUpdate = new AuraUpdate(guid, true);
-                    ReadCreateObjectBlock(packet, ref guid, updateData, auraUpdate, i);
-
-                    TraceNpcBotCreateObject("CreateObject2", oldGuid, guid, updateData);
+                    ReadCreateObjectBlock(packet, guid, updateData, auraUpdate, i);
 
                     if (guid.IsItem() && updateData.ObjectData.EntryID != null &&
                        !GameData.ItemTemplates.ContainsKey((uint)updateData.ObjectData.EntryID))
@@ -280,28 +197,17 @@ public partial class WorldClient
 
                     if (updateData.CreateData.MoveInfo != null || !guid.IsWorldObject())
                     {
-                        // Mirror of CreateObject1 — see filter comments there for rationale.
+                        // Transport/MOTransport remains gated until its placeholder position layout
+                        // is validated against a 3.4.3 capture.
                         bool filtered = false;
                         if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
                         {
                             var legacyHigh = oldGuid.GetHighGuidTypeLegacy();
                             if (legacyHigh == HighGuidTypeLegacy.Transport ||
-                                legacyHigh == HighGuidTypeLegacy.MOTransport)
+                                     legacyHigh == HighGuidTypeLegacy.MOTransport)
                             {
-                                Log.Print(LogType.Trace,
-                                    $"Skipping CreateObject2 for {legacyHigh} for V3_4_3 (Position=0 placeholder; pending MOTransport position fix) guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"}.");
+                                Log.Print(LogType.Network, $"[Phase5aTrace] Skipping Transport create2 guid={guid} (placeholder position pending capture validation).");
                                 filtered = true;
-                            }
-                            else if (legacyHigh == HighGuidTypeLegacy.GameObject)
-                            {
-                                var rot = updateData.CreateData?.MoveInfo?.Rotation;
-                                Log.Print(LogType.Trace,
-                                    $"Forwarding CreateObject2 for {legacyHigh} guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"} typeID={updateData.GameObjectData?.TypeID?.ToString() ?? "null"} state={updateData.GameObjectData?.State?.ToString() ?? "null"} rot=({rot?.X.ToString("F3") ?? "?"},{rot?.Y.ToString("F3") ?? "?"},{rot?.Z.ToString("F3") ?? "?"},{rot?.W.ToString("F3") ?? "?"}).");
-                            }
-                            else if (legacyHigh == HighGuidTypeLegacy.ItemContainer)
-                            {
-                                Log.Print(LogType.Trace,
-                                    $"[ItemContainerTrace] Forwarding CreateObject2 for 0x4700 ItemContainer guid={guid} entryID={updateData.ObjectData.EntryID?.ToString() ?? "null"}.");
                             }
                         }
 
@@ -480,121 +386,14 @@ public partial class WorldClient
                 UpdateObject = updateObject,
                 AuraUpdates = auraUpdates,
                 WaitingForItemIds = deferredFor,
+                EnqueuedAtUtc = DateTimeOffset.UtcNow,
             };
             var session = GetSession();
             lock (session.GameState.DeferredObjectUpdatesLock)
                 session.GameState.DeferredObjectUpdates.Add(pending);
 
-            // Release path: every SMSG_ITEM_QUERY_SINGLE_RESPONSE (valid or
-            // invalid) calls FlushDeferredUpdatesFor on its entry id. If the
-            // legacy server stops answering entirely, the connection-level
-            // TCP timeout tears the session down — the queue is per-session
-            // so it's GC'd along with the rest of the state.
+            _ = ReleaseDeferredObjectUpdateAfterTimeoutAsync(pending);
             return;
-        }
-
-        // V3_4_3-only: hold pet CreateObject batches when the player isn't yet known
-        // to the client (i.e. player's CreateObject is still in DeferredObjectUpdates
-        // waiting on item hotfixes). The V3_4_3 client requires the player object to
-        // exist BEFORE a child pet arrives — otherwise the pet's SummonedBy back-ref
-        // can't bind and the pet UI (portrait, action bar) never renders. Held pet
-        // batches are merged into the player's deferred batch in QueryHandler
-        // .FlushDeferredUpdatesFor so they ship atomically alongside the player.
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 &&
-            ContainsPetCreateObject(updateObject) &&
-            !GetSession().GameState.ClientKnownGuids.Contains(GetSession().GameState.CurrentPlayerGuid))
-        {
-            Log.Print(LogType.Trace,
-                $"[PetHoldTrace] holding pet update batch ({updateObject.ObjectUpdates.Count} obj(s)) — player CreateObject not yet delivered");
-            GetSession().GameState.PendingPetUpdateBatches.Add(updateObject);
-            return;
-        }
-
-        // Re-resolve pet-pointing UnitData fields. Mirrors the
-        // QueryHandler.FlushDeferredUpdatesFor call so non-deferred batches also
-        // get the player.Summon → realEntry rebind. No-op on TC native repacks.
-        UpdateObject.ReseatStalePetGuids(updateObject, GetSession().GameState);
-
-        // Pre-filter Values updates BEFORE the emptiness check so we don't ship
-        // 11-byte empty SMSG_UPDATE_OBJECT packets to the V3_4_3 client. cmangos
-        // sends Values updates for ~6 nearby GameObjects every ~500ms; without
-        // the pre-filter, every one becomes a no-op packet that floods the modern
-        // client and may prevent it from completing the world-ready handshake.
-        UpdateObject.FilterV3_4_3Values(updateObject, GetSession().GameState);
-
-        // V3_4_3-only: split player Values updates into a separate
-        // SMSG_UPDATE_OBJECT. Per HermesProxy-WOTLK fork commit 18caaf7 ("multiple
-        // combat dc should be fixed — split creature and player packets to be
-        // separate"). When combat starts, the legacy server emits a single
-        // SMSG_UPDATE_OBJECT carrying both the target creature's HP/Aura delta and
-        // the player's Power delta. Even with StripPlayerCrashingBlocks already
-        // applied above, the combined batch corrupts the V3_4_3 client's
-        // changedMask cascade and triggers a reason-7 disconnect within ~4-10s of
-        // the first auto-attack swing. Sending creature updates first preserves
-        // the order legacy servers emit (target state arrives before owner deltas).
-        List<ObjectUpdate>? playerValuesUpdates = null;
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
-        {
-            WowGuid128 playerGuidForSplit = GetSession().GameState.CurrentPlayerGuid;
-            foreach (var upd in updateObject.ObjectUpdates)
-            {
-                if (upd.Type == UpdateTypeModern.Values && upd.Guid == playerGuidForSplit)
-                {
-                    playerValuesUpdates ??= new List<ObjectUpdate>();
-                    playerValuesUpdates.Add(upd);
-                }
-            }
-            if (playerValuesUpdates != null)
-            {
-                updateObject.ObjectUpdates.RemoveAll(u =>
-                    u.Type == UpdateTypeModern.Values && u.Guid == playerGuidForSplit);
-                Log.Print(LogType.Trace,
-                    $"[UpdateObjectTrace] V3_4_3 split: deferring {playerValuesUpdates.Count} player Values update(s) to a follow-up SMSG_UPDATE_OBJECT");
-            }
-        }
-
-        // V3_4_3-only: split CreateObject entries into per-packet SMSG_UPDATE_OBJECT
-        // sends. The V3_4_3.54261 client OOMs when one envelope carries multiple
-        // CreateObjects in dense scripted-event spawns (observed: 11-Create batch at
-        // 8771 bytes → ~6 GB WOWGUID-array allocation → freeze → reason=7; 5-Create
-        // batch at 3632 bytes survives). Splitting keeps each packet's per-object
-        // allocation bounded; total wire bytes are unchanged. Creates ship first so
-        // any same-tick Values updates the client receives next reference already-
-        // known guids (FilterV3_4_3Values already populated ClientKnownGuids).
-        List<ObjectUpdate>? createsToSplit = null;
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
-        {
-            int createCount = 0;
-            foreach (var u in updateObject.ObjectUpdates)
-            {
-                if (u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2)
-                    createCount++;
-            }
-            if (createCount > 1)
-            {
-                createsToSplit = new List<ObjectUpdate>(createCount);
-                foreach (var u in updateObject.ObjectUpdates)
-                {
-                    if (u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2)
-                        createsToSplit.Add(u);
-                }
-                updateObject.ObjectUpdates.RemoveAll(u =>
-                    u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2);
-                Log.Print(LogType.Trace,
-                    $"[UpdateObjectTrace] V3_4_3 CreateObject split: extracted {createsToSplit.Count} Creates to per-packet sends (avoid client OOM on multi-Create batches)");
-            }
-        }
-
-        // Ship the per-Create packets first so their guids are known before any
-        // remaining Values reach the client.
-        if (createsToSplit != null)
-        {
-            foreach (var create in createsToSplit)
-            {
-                UpdateObject perCreate = new UpdateObject(GetSession().GameState);
-                perCreate.ObjectUpdates.Add(create);
-                SendPacketToClient(perCreate);
-            }
         }
 
         if (updateObject.ObjectUpdates.Count != 0 ||
@@ -602,110 +401,8 @@ public partial class WorldClient
             updateObject.OutOfRangeGuids.Count != 0)
             SendPacketToClient(updateObject);
 
-        // V3_4_3-only: if a SMSG_PET_SPELLS_MESSAGE was held back because its pet
-        // wasn't in ClientKnownGuids yet, and the batch we just sent contained a
-        // CreateObject for that pet, flush the cached spells with the corrected
-        // PetGUID (the pet was registered during ReadCreateObjectBlock, so
-        // legacyGuid.To128 now resolves correctly).
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
-        {
-            var pendingSpells = GetSession().GameState.PendingPetSpells;
-            var pendingLegacy = GetSession().GameState.PendingPetSpellsLegacyGuid;
-            if (pendingSpells != null && pendingLegacy.HasValue)
-            {
-                WowGuid128 correctedPetGuid = pendingLegacy.Value.To128(GetSession().GameState);
-                bool petWasCreatedInBatch = false;
-                // Search both lists — Creates may have been moved to createsToSplit.
-                foreach (var u in updateObject.ObjectUpdates)
-                {
-                    if (u.CreateData != null
-                        && (u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2)
-                        && u.Guid == correctedPetGuid)
-                    {
-                        petWasCreatedInBatch = true;
-                        break;
-                    }
-                }
-                if (!petWasCreatedInBatch && createsToSplit != null)
-                {
-                    foreach (var u in createsToSplit)
-                    {
-                        if (u.CreateData != null && u.Guid == correctedPetGuid)
-                        {
-                            petWasCreatedInBatch = true;
-                            break;
-                        }
-                    }
-                }
-                if (petWasCreatedInBatch)
-                {
-                    var stalePetGuid = pendingSpells.PetGUID;
-                    pendingSpells.PetGUID = correctedPetGuid;
-
-                    // No LEARNED synthesis: real SMSG_PET_LEARNED_SPELLS is forwarded
-                    // by PetHandler.HandlePetLearnedSpells only on actual server learn
-                    // events. Native TC 3.4.3 sniff shows zero LEARNED on login /
-                    // re-summon, and the pet tab binds from SPELLS_MESSAGE alone.
-                    Log.Print(LogType.Trace,
-                        $"[PetSpellsFlush] sending cached SMSG_PET_SPELLS_MESSAGE — stale={stalePetGuid} corrected={correctedPetGuid}");
-                    SendPacketToClient(pendingSpells);
-                    GetSession().GameState.PendingPetSpells = null;
-                    GetSession().GameState.PendingPetSpellsLegacyGuid = null;
-                }
-            }
-        }
-
-        if (playerValuesUpdates != null && playerValuesUpdates.Count > 0)
-        {
-            UpdateObject playerUpdateObject = new UpdateObject(GetSession().GameState);
-            playerUpdateObject.ObjectUpdates.AddRange(playerValuesUpdates);
-            SendPacketToClient(playerUpdateObject);
-        }
-
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
-
-        // V3_4_3-only: when this batch contained any CreateObject for the player
-        // (matched by GUID, not just ThisIsYou — cmangos doesn't always set
-        // UpdateFlag.Self), immediately follow it with an empty
-        // SMSG_AURA_UPDATE_ALL for the player.
-        // TC reference packet #148 sends a 329-byte player UpdateAll right after the
-        // CreateObject and before SMSG_UPDATE_ACTION_BUTTONS — it's part of the
-        // sequence the V3_4_3 client expects before triggering
-        // CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE. cmangos sends per-aura updates
-        // BEFORE the create, so we need to synthesize the post-create UpdateAll
-        // ourselves. Empty list is fine for a fresh / unbuffed character; any real
-        // auras already arrived via the legacy SMSG_AURA_UPDATE flow.
-        if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261)
-        {
-            WowGuid128 currentPlayerGuid = GetSession().GameState.CurrentPlayerGuid;
-            bool playerCreateInBatch = false;
-            int objectsAfterFilter = updateObject.ObjectUpdates.Count;
-            foreach (var u in updateObject.ObjectUpdates)
-            {
-                if (u.CreateData != null && u.Guid == currentPlayerGuid &&
-                    (u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2))
-                {
-                    playerCreateInBatch = true;
-                    break;
-                }
-            }
-
-            // Unconditional trace at end-of-batch so we can see whether the player
-            // CreateObject is reaching this code path at all.
-            Log.Print(LogType.Trace,
-                $"[PlayerEnterTrace] batch end: objectsRemainingAfterWrite={objectsAfterFilter} " +
-                $"playerCreateMatched={playerCreateInBatch} playerGuid={currentPlayerGuid} " +
-                $"types=[{string.Join(",", updateObject.ObjectUpdates.Select(o => $"{o.Guid.Low}:{o.Type}"))}]");
-
-            if (playerCreateInBatch)
-            {
-                var playerAuraSync = BuildPlayerAuraSync(currentPlayerGuid);
-                SendPacketToClient(playerAuraSync);
-                Log.Print(LogType.Trace,
-                    $"[PlayerEnterTrace] post-CreateObject AURA_UPDATE_ALL sent for player guid={currentPlayerGuid} populatedAuras={playerAuraSync.Auras.Count}");
-            }
-        }
     }
 
     public void ReadNearObjectsBlock(WorldPacket packet, object index)
@@ -752,43 +449,31 @@ public partial class WorldClient
         }
     }
 
-    private static bool ContainsPetCreateObject(UpdateObject obj)
-    {
-        foreach (var u in obj.ObjectUpdates)
-        {
-            if (u.CreateData != null
-                && (u.Type == UpdateTypeModern.CreateObject1 || u.Type == UpdateTypeModern.CreateObject2)
-                && u.Guid.GetHighType() == HighGuidType.Pet)
-                return true;
-        }
-        return false;
-    }
-
-    private void ReadCreateObjectBlock(WorldPacket packet, ref WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, object index)
+    private void ReadCreateObjectBlock(WorldPacket packet, WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, object index)
     {
         updateData.CreateData.ObjectType = ObjectTypeConverter.Convert((ObjectTypeLegacy)packet.ReadUInt8());
         GetSession().GameState.StoreOriginalObjectType(guid, updateData.CreateData.ObjectType);
         ReadMovementUpdateBlock(packet, guid, updateData, index);
-        ReadValuesUpdateBlockOnCreate(packet, ref guid, updateData.CreateData.ObjectType, updateData, auraUpdate, index);
+        ReadValuesUpdateBlockOnCreate(packet, guid, updateData.CreateData.ObjectType, updateData, auraUpdate, index);
     }
 
-    public void ReadValuesUpdateBlockOnCreate(WorldPacket packet, ref WowGuid128 guid, ObjectType type, ObjectUpdate updateData, AuraUpdate auraUpdate, object index)
+    public void ReadValuesUpdateBlockOnCreate(WorldPacket packet, WowGuid128 guid, ObjectType type, ObjectUpdate updateData, AuraUpdate auraUpdate, object index)
     {
         BitArray? updateMaskArray = null;
         var updates = ReadValuesUpdateBlock(packet, ref type, index, true, null, out updateMaskArray, out var actuallyChangedValuesMaskArray);
-        StoreObjectUpdate(ref guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
+        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, null, true, updateData, actuallyChangedValuesMaskArray);
         lock (GetSession().GameState.ObjectCacheLock)
         {
             GetSession().GameState.ObjectCacheLegacy[guid] = updates;
         }
     }
 
-    public void ReadValuesUpdateBlock(WorldPacket packet, ref WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, PowerUpdate powerUpdate, int index)
+    public void ReadValuesUpdateBlock(WorldPacket packet, WowGuid128 guid, ObjectUpdate updateData, AuraUpdate auraUpdate, PowerUpdate powerUpdate, int index)
     {
         BitArray? updateMaskArray = null;
         ObjectType type = GetSession().GameState.GetOriginalObjectType(guid);
         var updates = ReadValuesUpdateBlock(packet, ref type, index, false, GetSession().GameState.GetCachedObjectFieldsLegacy(guid), out updateMaskArray, out var actuallyChangedValuesMaskArray);
-        StoreObjectUpdate(ref guid, type, updateMaskArray, updates, auraUpdate, powerUpdate, false, updateData, actuallyChangedValuesMaskArray);
+        StoreObjectUpdate(guid, type, updateMaskArray, updates, auraUpdate, powerUpdate, false, updateData, actuallyChangedValuesMaskArray);
     }
 
     private string GetIndexString(params object[] values)
@@ -1183,24 +868,16 @@ public partial class WorldClient
 
             for (int k = 0; k < fieldData.Count; ++k)
             {
-                int absoluteIndex = start + k;
-                // V3_4_3 field-table iterates past the legacy mask's bit count when
-                // the modern descriptor schema has fields beyond what 3.3.5 ships
-                // (observed: legacy mask covers 1056 bits, V3_4_3 player descriptors
-                // continue past that). Skip the out-of-range writes — missing fields
-                // are V3_4_3-only descriptors that have no legacy source anyway.
-                bool inRange = absoluteIndex < outActuallyChangedValuesMaskArray.Length;
-                if (!dict.ContainsKey(absoluteIndex))
+                if (!dict.ContainsKey(start + k))
                 {
-                    if (inRange)
-                        outActuallyChangedValuesMaskArray.Set(absoluteIndex, true);
-                    dict.Add(absoluteIndex, fieldData[k]);
+                    outActuallyChangedValuesMaskArray.Set(start + k, true);
+                    dict.Add(start + k, fieldData[k]);
                 }
                 else
                 {
-                    if (dict[absoluteIndex] != fieldData[k] && inRange)
-                        outActuallyChangedValuesMaskArray.Set(absoluteIndex, true);
-                    dict[absoluteIndex] = fieldData[k];
+                    if (dict[start + k] != fieldData[k])
+                        outActuallyChangedValuesMaskArray.Set(start + k, true);
+                    dict[start + k] = fieldData[k];
                 }
             }
         }
@@ -1224,18 +901,7 @@ public partial class WorldClient
         else
             flags = (UpdateFlag)packet.ReadUInt8();
 
-        bool legacySelf = flags.HasAnyFlag(UpdateFlag.Self);
-
-        // V3_4_3 client only sends CMSG_MOVE_INIT_ACTIVE_MOVER_COMPLETE in response
-        // to a CreateObject2 carrying ThisIsYou=true (TC Map.cpp:1857). cMangos
-        // frequently omits the legacy UpdateFlag.Self for the player's own
-        // CreateObject, so guid-match against CurrentPlayerGuid as the canonical
-        // signal that this is the active player and force the flag. Gated to
-        // V3_4_3 to avoid altering the legacy Self semantics for V1_14/V2_5.
-        bool guidMatchesPlayer =
-            ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 &&
-            guid == GetSession().GameState.CurrentPlayerGuid;
-        if (legacySelf || guidMatchesPlayer)
+        if (flags.HasAnyFlag(UpdateFlag.Self))
         {
             if (updateData != null)
                 updateData.CreateData.ThisIsYou = true;
@@ -1503,21 +1169,9 @@ public partial class WorldClient
             return GetGuidValue128(UpdateFields, field);
     }
 
-    // Reads a player-equipment slot guid (PLAYER_FIELD_INV_SLOT_HEAD,
-    // PACK_SLOT, BANK_SLOT, etc.) from the legacy update field stream and
-    // converts to the modern 128-bit form. Pre-Warlords legacy uses 64-bit
-    // guids; 6.0+ already uses 128-bit and pass through.
-    //
-    // cMangos packs equipped/container items under a non-standard 0x4700
-    // ItemContainer high-guid (TC/AC use the standard 0x4000 Item). The
-    // HighGuid table (HighGuid.cs:30) maps ItemContainer → Item, and the
-    // matching CreateObject blocks for these items are forwarded to the
-    // V3_4_3 client (see UpdateHandler:232+ / :292+), so a normal To128()
-    // conversion produces an Item-typed modern guid the client can resolve.
-    //
-    // (Earlier in the port we returned WowGuid128.Empty here as a defensive
-    // measure when CreateObject was ALSO filtered — that would have caused
-    // null-deref crashes. With creates now forwarded, the conversion is safe.)
+    // ItemContainer create/Values serialization is now enabled for 3.4.3, so preserve
+    // these GUIDs in the active-player inventory fields. The builder uses the stored
+    // original object type to distinguish Container Values updates from Item updates.
     private WowGuid128 GetSlotGuidValue(Dictionary<int, UpdateField> updates, int field)
     {
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V6_0_2_19033))
@@ -1529,23 +1183,10 @@ public partial class WorldClient
     public QuestLog? ReadQuestLogEntry(int i, BitArray? updateMaskArray, Dictionary<int, UpdateField> updates)
     {
         int PLAYER_QUEST_LOG_1_1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_QUEST_LOG_1_1);
-        // Quest log slot stride is backend-version dependent (verified against the
-        // proxy's own per-version PlayerField enums by enum-offset arithmetic):
-        //   Vanilla     (pre-V2_4_0): 3 fields — QuestID, StateFlags(+progress packed), Timer.
-        //   BC          (V2_4_0..V3_0_2): 4 fields — QuestID, StateFlags, Progress(packed 4× uint8), Timer.
-        //                              See V2_4_3_8606/UpdateFields.cs:152-156, _2_1 - _1_1 = 4.
-        //   WotLK+      (V3_0_2_9056+): 5 fields — QuestID, StateFlags, ProgressLo (obj 0,1 as uint16),
-        //                              ProgressHi (obj 2,3 as uint16), Timer.
-        //                              See V3_3_5a_12340/UpdateFields.cs:196-200, _2_1 - _1_1 = 5.
-        // Pre-fix (commit 0e1f311) used 5 unconditionally for V2_4_0+, which mis-strides the
-        // V2_4_3 backend by 1 field — slot N's QuestID gets read into slot N-1's EndTime.
-        bool isVanillaLayout = LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_4_0_8089);
-        bool isWotLKLayout   = LegacyVersion.AddedInVersion(ClientVersionBuild.V3_0_2_9056);
-        int sizePerEntry     = isVanillaLayout ? 3 : (isWotLKLayout ? 5 : 4);
-        int stateOffset      = 1;
-        int progressOffset   = isVanillaLayout ? -1 : 2;                      // BC: single packed-byte uint32; WotLK: progress lo
-        int progressOffsetHi = isWotLKLayout ? 3 : -1;                        // WotLK only: progress hi (obj 2,3 as uint16)
-        int timerOffset      = isVanillaLayout ? 2 : (isWotLKLayout ? 4 : 3); // sits in last slot field
+        int sizePerEntry = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_4_0_8089) ? 4 : 3;
+        int stateOffset = 1;
+        int progressOffset = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_4_0_8089) ? 2 : -1;
+        int timerOffset = LegacyVersion.AddedInVersion(ClientVersionBuild.V2_4_0_8089) ? 3 : 2;
         QuestLog? questLog = null;
 
         int index = PLAYER_QUEST_LOG_1_1 + i * sizePerEntry;
@@ -1556,9 +1197,6 @@ public partial class WorldClient
                 questLog = new QuestLog();
 
             questLog.QuestID = updates[index].Int32Value;
-            // Cache the QuestID for this slot so partial state-only updates can
-            // recover it. Mirrors the fork's behavior at WorldClient.cs:10857.
-            GetSession().GameState.QuestLogQuestIDs[i] = questLog.QuestID.Value;
         }
         if ((updateMaskArray != null && updateMaskArray[index + stateOffset]) ||
             (updateMaskArray == null && updates.ContainsKey(index + stateOffset)))
@@ -1568,21 +1206,17 @@ public partial class WorldClient
 
             if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_4_0_8089))
             {
-                // Vanilla: first 3 bytes are objective progress, each counter is 6 bits long, total 4 counters
+                // first 3 bytes are objective progress, each counter is 6 bits long, total 4 counters
                 uint rawValue = updates[index + stateOffset].UInt32Value;
-                questLog.ObjectiveProgress[0] = (short)(rawValue & 0x3F);
-                questLog.ObjectiveProgress[1] = (short)((rawValue & (0x3F << 6)) >> 6);
-                questLog.ObjectiveProgress[2] = (short)((rawValue & (0x3F << 12)) >> 12);
-                questLog.ObjectiveProgress[3] = (short)((rawValue & (0x3F << 18)) >> 18);
+                questLog.ObjectiveProgress[0] = (byte)(rawValue & 0x3F);
+                questLog.ObjectiveProgress[1] = (byte)((rawValue & (0x3F << 6)) >> 6);
+                questLog.ObjectiveProgress[2] = (byte)((rawValue & (0x3F << 12)) >> 12);
+                questLog.ObjectiveProgress[3] = (byte)((rawValue & (0x3F << 18)) >> 18);
                 questLog.StateFlags = ((rawValue >> 24) & 0xFF);
             }
             else
                 questLog.StateFlags = updates[index + stateOffset].UInt32Value;
         }
-        // BC (single uint32, 4× uint8) and WotLK (uint32, 2× uint16) progress decode.
-        // Field +2 holds:
-        //   BC:    (obj0 b0) | (obj1 b1) | (obj2 b2) | (obj3 b3)        — 4 counters per field
-        //   WotLK: (obj0 lo16) | (obj1 hi16)                            — 2 counters per field, hi pair lives at +3
         if (progressOffset != -1 &&
            ((updateMaskArray != null && updateMaskArray[index + progressOffset]) ||
            (updateMaskArray == null && updates.ContainsKey(index + progressOffset))))
@@ -1590,30 +1224,10 @@ public partial class WorldClient
             if (questLog == null)
                 questLog = new QuestLog();
 
-            uint progress = updates[index + progressOffset].UInt32Value;
-            if (isWotLKLayout)
-            {
-                questLog.ObjectiveProgress[0] = (short)(progress & 0xFFFF);
-                questLog.ObjectiveProgress[1] = (short)((progress >> 16) & 0xFFFF);
-            }
-            else
-            {
-                questLog.ObjectiveProgress[0] = (short)(progress & 0xFF);
-                questLog.ObjectiveProgress[1] = (short)((progress >> 8) & 0xFF);
-                questLog.ObjectiveProgress[2] = (short)((progress >> 16) & 0xFF);
-                questLog.ObjectiveProgress[3] = (short)((progress >> 24) & 0xFF);
-            }
-        }
-        if (progressOffsetHi != -1 &&
-           ((updateMaskArray != null && updateMaskArray[index + progressOffsetHi]) ||
-           (updateMaskArray == null && updates.ContainsKey(index + progressOffsetHi))))
-        {
-            if (questLog == null)
-                questLog = new QuestLog();
-
-            uint progressHi = updates[index + progressOffsetHi].UInt32Value;
-            questLog.ObjectiveProgress[2] = (short)(progressHi & 0xFFFF);
-            questLog.ObjectiveProgress[3] = (short)((progressHi >> 16) & 0xFFFF);
+            questLog.ObjectiveProgress[0] = (byte)(updates[index + progressOffset].UInt32Value & 0xFF);
+            questLog.ObjectiveProgress[1] = (byte)((updates[index + progressOffset].UInt32Value >> 8) & 0xFF);
+            questLog.ObjectiveProgress[2] = (byte)((updates[index + progressOffset].UInt32Value >> 16) & 0xFF);
+            questLog.ObjectiveProgress[3] = (byte)((updates[index + progressOffset].UInt32Value >> 24) & 0xFF);
         }
         if ((updateMaskArray != null && updateMaskArray[index + timerOffset]) ||
             (updateMaskArray == null && updates.ContainsKey(index + timerOffset)))
@@ -1624,65 +1238,7 @@ public partial class WorldClient
             questLog.EndTime = updates[index + timerOffset].UInt32Value;
         }
 
-        // Cache fallback: if this update touched the slot but QuestID wasn't
-        // marked dirty (TC commonly sends state/progress-only updates), populate
-        // QuestID from the cached value. Otherwise the slot would surface as
-        // QuestID=0 and the writer treats it as empty → quest "disappears" from
-        // the V3_4_3 client log even though it's still in the player's log.
-        if (questLog != null && !questLog.QuestID.HasValue)
-        {
-            int cachedId = GetSession().GameState.QuestLogQuestIDs[i];
-            if (cachedId != 0)
-                questLog.QuestID = cachedId;
-        }
-
-        // QuestID explicitly cleared (quest abandoned/completed) → clear cache.
-        if (questLog != null && questLog.QuestID.HasValue && questLog.QuestID.Value == 0)
-            GetSession().GameState.QuestLogQuestIDs[i] = 0;
-
-        bool anyFieldPresent =
-            updates.ContainsKey(index) ||
-            updates.ContainsKey(index + stateOffset) ||
-            (progressOffset != -1 && updates.ContainsKey(index + progressOffset)) ||
-            (progressOffsetHi != -1 && updates.ContainsKey(index + progressOffsetHi)) ||
-            updates.ContainsKey(index + timerOffset);
-        if (anyFieldPresent || (questLog != null && questLog.QuestID.HasValue && questLog.QuestID.Value != 0))
-        {
-            Framework.Logging.Log.Print(Framework.Logging.LogType.Trace,
-                $"[QuestLogRead] slot={i} questId={(questLog?.QuestID.GetValueOrDefault() ?? 0)} state={(questLog?.StateFlags ?? 0)} " +
-                $"baseFieldIndex={index} sizePerEntry={sizePerEntry} hasQID={updates.ContainsKey(index)} " +
-                $"hasState={updates.ContainsKey(index + stateOffset)} hasTimer={updates.ContainsKey(index + timerOffset)}");
-        }
         return questLog;
-    }
-
-    // Build a fully-populated SMSG_AURA_UPDATE_ALL for the player, sourcing aura state
-    // from the GameSessionData.KnownAuras tracker (populated incrementally by
-    // SpellHandler.HandleAuraUpdate). Used by the post-CreateObject deferred-flush —
-    // the V3_4_3 client drops aura updates for objects it hasn't created yet, so the
-    // proxy's pre-Create per-aura forwards are ignored client-side. We re-emit a
-    // complete sync AFTER the player CreateObject to restore buff-bar state that would
-    // otherwise be wiped by an empty UpdateAll marker.
-    //
-    // Reading from KnownAuras (not from legacy UNIT_FIELD_AURA cached fields) is
-    // required because TC delivers shapeshift / debuff state via SMSG_AURA_UPDATE only,
-    // not via the UpdateFields cache — so the cached UpdateFields lookup returned
-    // unrelated data (e.g. UNIT_FIELD_BOUNDINGRADIUS read as a spell ID = 1065353216
-    // = float 1.0f) and produced garbage AuraInfo entries.
-    //
-    // Returns an empty UpdateAll sync if the player has no tracked auras yet — safe
-    // for fresh / unbuffed characters.
-    public AuraUpdate BuildPlayerAuraSync(WowGuid128 playerGuid)
-    {
-        var sync = new AuraUpdate(playerGuid, true);
-        var knownAuras = GetSession().GameState.KnownAuras;
-        if (!knownAuras.TryGetValue(playerGuid, out var slotMap))
-            return sync;
-
-        foreach (var kvp in slotMap)
-            sync.Auras.Add(kvp.Value);
-
-        return sync;
     }
 
     public AuraDataInfo? ReadAuraSlot(byte i, WowGuid128 guid, Dictionary<int, UpdateField> updates)
@@ -1714,9 +1270,7 @@ public partial class WorldClient
             if (updates.ContainsKey(flagsIndex))
             {
                 ushort flags = (ushort)((updates[flagsIndex].UInt32Value >> ((i % 4) * 8)) & 0xFF);
-                ModernVersion.ConvertAuraFlags(flags, i, out var convertedFlags, out var convertedActiveFlags);
-                data.Flags = convertedFlags;
-                data.ActiveFlags = convertedActiveFlags;
+                ModernVersion.ConvertAuraFlags(flags, i, out data.Flags, out data.ActiveFlags);
             }
         }
         else
@@ -1725,9 +1279,7 @@ public partial class WorldClient
             if (updates.ContainsKey(flagsIndex))
             {
                 ushort flags = (ushort)((updates[flagsIndex].UInt32Value >> ((i % 8) * 4)) & 0xF);
-                ModernVersion.ConvertAuraFlags(flags, i, out var convertedFlags, out var convertedActiveFlags);
-                data.Flags = convertedFlags;
-                data.ActiveFlags = convertedActiveFlags;
+                ModernVersion.ConvertAuraFlags(flags, i, out data.Flags, out data.ActiveFlags);
             }
         }
 
@@ -1747,7 +1299,7 @@ public partial class WorldClient
             data.Applications++;
 
         if (GameData.SpellEffectPoints.TryGetValue(spellId, out var basePoints))
-            data.Points = basePoints;  // ImmutableArray<float> from GameData (cached, allocation-free reuse)
+            data.Points = basePoints;
 
         return data;
     }
@@ -1775,9 +1327,9 @@ public partial class WorldClient
         return flags;
     }
 
-    public void StoreObjectUpdate(ref WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray actuallyChangedValuesMaskArray)
+    public void StoreObjectUpdate(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData, BitArray actuallyChangedValuesMaskArray)
     {
-        StoreObjectUpdateInternal(ref guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData);
+        StoreObjectUpdateInternal(guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData);
         AfterStoreObjectUpdateHook(guid, objectType, updateMaskArray, updates, auraUpdate, powerUpdate, isCreate, updateData, actuallyChangedValuesMaskArray);
     }
 
@@ -1843,7 +1395,7 @@ public partial class WorldClient
         }
     }
     
-    private void StoreObjectUpdateInternal(ref WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData)
+    private void StoreObjectUpdateInternal(WowGuid128 guid, ObjectType objectType, BitArray updateMaskArray, Dictionary<int, UpdateField> updates, AuraUpdate auraUpdate, PowerUpdate? powerUpdate, bool isCreate, ObjectUpdate updateData)
     {
         // Object Fields
         int OBJECT_FIELD_GUID = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_GUID);
@@ -1855,36 +1407,6 @@ public partial class WorldClient
         if (OBJECT_FIELD_ENTRY >= 0 && updateMaskArray[OBJECT_FIELD_ENTRY])
         {
             updateData.ObjectData.EntryID = updates[OBJECT_FIELD_ENTRY].Int32Value;
-
-            // Pet GUID translation fix: legacy MaNGOS-style backends encode pet_number
-            // (a per-character spawn counter) in the Pet GUID's entry slot, while the
-            // modern client expects creature_template.entry there. The first time we
-            // process a Pet's CreateObject we discover the real entry from
-            // OBJECT_FIELD_ENTRY and rewrite the modern GUID. Subsequent legacy→modern
-            // conversions hit the registration map and return the corrected GUID.
-            // Detection clause is false on TC backends (entry slot already matches),
-            // making this a zero-cost no-op there.
-            if (objectType == ObjectType.Unit
-                && guid.GetHighType() == HighGuidType.Pet
-                && updateData.ObjectData.EntryID.HasValue
-                && (uint)updateData.ObjectData.EntryID.Value != guid.GetEntry())
-            {
-                uint realEntry = (uint)updateData.ObjectData.EntryID.Value;
-                uint petNumber = guid.GetEntry();
-                ulong counter = guid.GetCounter();
-                var legacyGuid = new WowGuid64(HighGuidTypeLegacy.Pet, petNumber, (uint)counter);
-                var corrected = WowGuid128.Create(HighGuidType703.Pet, 0, realEntry, counter);
-
-                GetSession().GameState.RegisterPet(legacyGuid, corrected, realEntry, petNumber);
-
-                updateData.Guid = corrected;
-                updateData.ObjectData.Guid = corrected;
-                auraUpdate.UnitGUID = corrected;
-                guid = corrected;
-
-                Log.Print(LogType.Trace,
-                    $"[PetGuidFix] pet_number={petNumber} realEntry={realEntry} counter={counter} corrected={corrected}");
-            }
         }
         int OBJECT_FIELD_SCALE_X = LegacyVersion.GetUpdateField(ObjectField.OBJECT_FIELD_SCALE_X);
         if (OBJECT_FIELD_SCALE_X >= 0 && updateMaskArray[OBJECT_FIELD_SCALE_X])
@@ -1941,20 +1463,6 @@ public partial class WorldClient
             if (ITEM_FIELD_FLAGS >= 0 && updateMaskArray[ITEM_FIELD_FLAGS])
             {
                 updateData.ItemData.Flags = updates[ITEM_FIELD_FLAGS].UInt32Value;
-            }
-
-            if (ModernVersion.ExpansionVersion >= 3)
-            {
-                int entry = updateData.ObjectData.EntryID
-                    ?? (int)GetSession().GameState.GetItemId(guid);
-                if (entry != 0 && GameData.Heirlooms.Contains(entry))
-                {
-                    uint baseFlags = updateData.ItemData.Flags
-                        ?? (ITEM_FIELD_FLAGS >= 0
-                            ? (GetSession().GameState.GetCachedObjectFieldsLegacy(guid)?[ITEM_FIELD_FLAGS].UInt32Value ?? 0u)
-                            : 0u);
-                    updateData.ItemData.Flags = baseFlags | (uint)ItemFieldFlag.Soulbound | (uint)ItemFieldFlag.Child;
-                }
             }
             int ITEM_FIELD_ENCHANTMENT = LegacyVersion.GetUpdateField(ItemField.ITEM_FIELD_ENCHANTMENT);
             if (ITEM_FIELD_ENCHANTMENT >= 0)
@@ -2164,16 +1672,9 @@ public partial class WorldClient
                     GetSession().GameState.HunterPetGuids.Add(guid);
 
                 if (objectType == ObjectType.Unit)
-                    GetSession().GameState.StoreCreatureClass(guid, (Class)updateData.UnitData.ClassId);
+                    GetSession().GameState.StoreCreatureClass(guid.GetEntry(), (Class)updateData.UnitData.ClassId);
                 else
                     updateData.PlayerData.ArenaFaction = (byte)(GameData.IsAllianceRace((Race)updateData.UnitData.RaceId) ? 1 : 0);
-
-                if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 &&
-                    guid == GetSession().GameState.CurrentPlayerGuid)
-                {
-                    Log.Print(LogType.Debug,
-                        $"[V343Trace][PlayerClass] class={(Class)updateData.UnitData.ClassId} race={(Race)updateData.UnitData.RaceId} displayPower={(PowerType)updateData.UnitData.DisplayPower}");
-                }
             }
 
             int UNIT_FIELD_POWER1 = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_POWER1);
@@ -2536,16 +2037,7 @@ public partial class WorldClient
                         updateData.UnitData.StatNegBuff[i] = updates[UNIT_FIELD_NEGSTAT0 + i].Int32Value;
                 }
             }
-            // V3_3_5a (cMangos / TrinityCore wotlk_classic) emits the resistance arrays
-            // as per-element enums (UNIT_FIELD_RESISTANCES_ARMOR/_HOLY/_FIRE/...) instead
-            // of the parent UNIT_FIELD_RESISTANCES used by V1_12 / V1_14 / V2_x / V3_4_3.
-            // Wire offsets are contiguous and identical, so slot 0 of the array sits at
-            // _ARMOR. Without this fallback Armor (Resistances[0]) and the BuffMods
-            // arrays stay zero on the V3_4_3 client — visible in the character panel as
-            // Armor=0 and a broken Stamina-tooltip Health-bonus calculation.
             int UNIT_FIELD_RESISTANCES = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCES);
-            if (UNIT_FIELD_RESISTANCES < 0)
-                UNIT_FIELD_RESISTANCES = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCES_ARMOR);
             if (UNIT_FIELD_RESISTANCES >= 0)
             {
                 for (int i = 0; i < 7; i++)
@@ -2555,8 +2047,6 @@ public partial class WorldClient
                 }
             }
             int UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE);
-            if (UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE < 0)
-                UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE_ARMOR);
             if (UNIT_FIELD_RESISTANCEBUFFMODSPOSITIVE >= 0)
             {
                 for (int i = 0; i < 7; i++)
@@ -2566,8 +2056,6 @@ public partial class WorldClient
                 }
             }
             int UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE);
-            if (UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE < 0)
-                UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE_ARMOR);
             if (UNIT_FIELD_RESISTANCEBUFFMODSNEGATIVE >= 0)
             {
                 for (int i = 0; i < 7; i++)
@@ -2608,13 +2096,8 @@ public partial class WorldClient
             int UNIT_FIELD_ATTACK_POWER_MODS = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_ATTACK_POWER_MODS);
             if (UNIT_FIELD_ATTACK_POWER_MODS >= 0 && updateMaskArray[UNIT_FIELD_ATTACK_POWER_MODS])
             {
-                // Packed two int16: low word = POSITIVE mod, high word = NEGATIVE mod
-                // (mangos/TC SetInt16Value idx0=pos, idx1=neg). Modern total = AttackPower +
-                // ModPos + ModNeg, so Neg is stored SIGNED (negative). Was swapped (low→Neg,
-                // high→Pos) AND zero-extended (lost sign) → flat +AP items never showed green.
-                int apMods = updates[UNIT_FIELD_ATTACK_POWER_MODS].Int32Value;
-                updateData.UnitData.AttackPowerModPos = (short)apMods;
-                updateData.UnitData.AttackPowerModNeg = (short)(apMods >> 16);
+                updateData.UnitData.AttackPowerModNeg = (updates[UNIT_FIELD_ATTACK_POWER_MODS].Int32Value & 0xFFFF);
+                updateData.UnitData.AttackPowerModPos = ((updates[UNIT_FIELD_ATTACK_POWER_MODS].Int32Value >> 16) & 0xFFFF);
             }
             int UNIT_FIELD_RANGED_ATTACK_POWER = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RANGED_ATTACK_POWER);
             if (UNIT_FIELD_RANGED_ATTACK_POWER >= 0 && updateMaskArray[UNIT_FIELD_RANGED_ATTACK_POWER])
@@ -2624,10 +2107,8 @@ public partial class WorldClient
             int UNIT_FIELD_RANGED_ATTACK_POWER_MODS = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RANGED_ATTACK_POWER_MODS);
             if (UNIT_FIELD_RANGED_ATTACK_POWER_MODS >= 0 && updateMaskArray[UNIT_FIELD_RANGED_ATTACK_POWER_MODS])
             {
-                // Same packing as melee: low word = POSITIVE, high word = NEGATIVE (signed).
-                int rapMods = updates[UNIT_FIELD_RANGED_ATTACK_POWER_MODS].Int32Value;
-                updateData.UnitData.RangedAttackPowerModPos = (short)rapMods;
-                updateData.UnitData.RangedAttackPowerModNeg = (short)(rapMods >> 16);
+                updateData.UnitData.RangedAttackPowerModNeg = (updates[UNIT_FIELD_RANGED_ATTACK_POWER_MODS].Int32Value & 0xFFFF);
+                updateData.UnitData.RangedAttackPowerModPos = ((updates[UNIT_FIELD_RANGED_ATTACK_POWER_MODS].Int32Value >> 16) & 0xFFFF);
             }
             int UNIT_FIELD_RANGED_ATTACK_POWER_MULTIPLIER = LegacyVersion.GetUpdateField(UnitField.UNIT_FIELD_RANGED_ATTACK_POWER_MULTIPLIER);
             if (UNIT_FIELD_RANGED_ATTACK_POWER_MULTIPLIER >= 0 && updateMaskArray[UNIT_FIELD_RANGED_ATTACK_POWER_MULTIPLIER])
@@ -2764,20 +2245,10 @@ public partial class WorldClient
             if (PLAYER_QUEST_LOG_1_1 >= 0)
             {
                 int questsCount = LegacyVersion.GetQuestLogSize();
-                int populatedSlots = 0;
-                System.Text.StringBuilder slotSummary = new();
                 for (int i = 0; i < questsCount; i++)
                 {
-                    QuestLog? entry = ReadQuestLogEntry(i, updateMaskArray, updates);
-                    updateData.PlayerData.QuestLog[i] = entry!;
-                    if (entry != null && entry.QuestID.HasValue && entry.QuestID.Value != 0)
-                    {
-                        populatedSlots++;
-                        slotSummary.Append($" [{i}]={entry.QuestID.Value}");
-                    }
+                    updateData.PlayerData.QuestLog[i] = ReadQuestLogEntry(i, updateMaskArray, updates)!;
                 }
-                Framework.Logging.Log.Print(Framework.Logging.LogType.Trace,
-                    $"[QuestLogReadLoop] questsCount={questsCount} populated={populatedSlots} slots:{slotSummary}");
             }
             int PLAYER_CHOSEN_TITLE = LegacyVersion.GetUpdateField(PlayerField.PLAYER_CHOSEN_TITLE);
             if (PLAYER_CHOSEN_TITLE >= 0 && updateMaskArray[PLAYER_CHOSEN_TITLE])
@@ -2812,36 +2283,20 @@ public partial class WorldClient
                 int offset = 2;
                 for (int i = 0; i < 19; i++)
                 {
-                    int itemIdIndex = PLAYER_VISIBLE_ITEM_1_ENTRYID + i * offset;
-                    int enchantIndex = itemIdIndex + 1;
-                    if (updateMaskArray[itemIdIndex] || updateMaskArray[enchantIndex])
+                    if (updateMaskArray[PLAYER_VISIBLE_ITEM_1_ENTRYID + i * offset])
                     {
-                        int itemId = updates.ContainsKey(itemIdIndex) ? updates[itemIdIndex].Int32Value : 0;
-                        // WotLK packs both perm and temp enchant visuals into one PLAYER_VISIBLE_ITEM_X_ENCHANTMENT
-                        // dword (TC's SetVisibleItemSlot resolves perm vs. temp server-side); shaman imbues
-                        // and similar temp enchants flow through this same field for the visual-glow path.
-                        ushort itemVisual = updates.ContainsKey(enchantIndex)
-                            ? (ushort)GameData.GetItemEnchantVisual(updates[enchantIndex].UInt32Value)
-                            : (ushort)0;
-                        updateData.PlayerData.VisibleItems[i] = new VisibleItem(itemId, 0, itemVisual);
+                        int itemId = updates[PLAYER_VISIBLE_ITEM_1_ENTRYID + i * offset].Int32Value;
+                        updateData.PlayerData.VisibleItems[i] = new VisibleItem(itemId, 0, 0);
                     }
                 }
             }
             int PLAYER_FIELD_INV_SLOT_HEAD = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_INV_SLOT_HEAD);
             if (PLAYER_FIELD_INV_SLOT_HEAD >= 0)
             {
-                bool tracePlayer = ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 &&
-                                   guid == GetSession().GameState.CurrentPlayerGuid;
                 for (int i = 0; i < 23; i++)
                 {
                     if (updateMaskArray[PLAYER_FIELD_INV_SLOT_HEAD + i * 2])
-                    {
-                        var slotGuid = GetSlotGuidValue(updates, PLAYER_FIELD_INV_SLOT_HEAD + i * 2);
-                        updateData.ActivePlayerData.InvSlots[i] = slotGuid;
-                        if (tracePlayer)
-                            Log.Print(LogType.Debug,
-                                $"[V343Trace][InvSlot] player slot={i} guid={slotGuid}");
-                    }
+                        updateData.ActivePlayerData.InvSlots[i] = GetSlotGuidValue(updates, PLAYER_FIELD_INV_SLOT_HEAD + i * 2);
                 }
             }
             int PLAYER_FIELD_PACK_SLOT_1 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_PACK_SLOT_1);
@@ -2988,7 +2443,6 @@ public partial class WorldClient
             if (PLAYER_FIELD_COMBO_TARGET >= 0 && updateMaskArray[PLAYER_FIELD_COMBO_TARGET])
             {
                 updateData.ActivePlayerData.ComboTarget = GetGuidValue(updates, PlayerField.PLAYER_FIELD_COMBO_TARGET).To128(GetSession().GameState);
-                updateData.UnitData.ComboTarget = updateData.ActivePlayerData.ComboTarget;
             }
             int PLAYER_FIELD_KNOWN_TITLES = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_KNOWN_TITLES);
             if (PLAYER_FIELD_KNOWN_TITLES >= 0)
@@ -3039,69 +2493,6 @@ public partial class WorldClient
             if (PLAYER_CHARACTER_POINTS1 >= 0 && updateMaskArray[PLAYER_CHARACTER_POINTS1])
             {
                 updateData.ActivePlayerData.CharacterPoints = updates[PLAYER_CHARACTER_POINTS1].Int32Value;
-            }
-            // Glyph slot unlock bitmask. Bit N = slot N is unlocked. Legacy 3.3.5a server
-            // sets bits as the player levels through 15/30/50/70/80 (final two slots both
-            // at 80). Without forwarding this, GameSessionData.GlyphsEnabled stays 0 and
-            // V3_4_3 client locks every slot ("requires level 15 to unlock").
-            int PLAYER_GLYPHS_ENABLED = LegacyVersion.GetUpdateField(PlayerField.PLAYER_GLYPHS_ENABLED);
-            if (PLAYER_GLYPHS_ENABLED >= 0 && updateMaskArray[PLAYER_GLYPHS_ENABLED])
-            {
-                byte mask = (byte)(updates[PLAYER_GLYPHS_ENABLED].UInt32Value & 0xFF);
-                GetSession().GameState.GlyphsEnabled = mask;
-                updateData.ActivePlayerData.GlyphsEnabled = mask;
-                Log.Print(LogType.Network, $"[Glyphs] PLAYER_GLYPHS_ENABLED bitmask=0x{mask:X2}");
-            }
-            // PLAYER_FIELD_GLYPHS_1..6 (uint32 each). Legacy server sends these as Values
-            // updates on glyph apply/remove and on dual-spec switch. Without reading them,
-            // GameState.ActiveGlyphs stays at the value last set by TalentHandler — which
-            // is correct for spec switch (TalentHandler updates it) but misses standalone
-            // glyph removal. Mirror into the cache and mark dirty so the next player
-            // Values update re-emits GlyphSlots in the modern descriptor (iter-14).
-            PlayerField[] glyphFields = {
-                PlayerField.PLAYER_FIELD_GLYPHS_1, PlayerField.PLAYER_FIELD_GLYPHS_2,
-                PlayerField.PLAYER_FIELD_GLYPHS_3, PlayerField.PLAYER_FIELD_GLYPHS_4,
-                PlayerField.PLAYER_FIELD_GLYPHS_5, PlayerField.PLAYER_FIELD_GLYPHS_6,
-            };
-            for (int gi = 0; gi < PlayerConst.MaxGlyphSlots; gi++)
-            {
-                int gIdx = LegacyVersion.GetUpdateField(glyphFields[gi]);
-                if (gIdx >= 0 && updateMaskArray[gIdx])
-                {
-                    ushort glyphId = (ushort)(updates[gIdx].UInt32Value & 0xFFFF);
-                    if (GetSession().GameState.ActiveGlyphs[gi] != glyphId)
-                    {
-                        GetSession().GameState.ActiveGlyphs[gi] = glyphId;
-                        GetSession().GameState.ActiveGlyphsDirty = true;
-                        Log.Print(LogType.Network, $"[Glyphs] PLAYER_FIELD_GLYPHS_{gi + 1} GlyphID={glyphId} (slot {gi})");
-                    }
-                }
-            }
-            // PLAYER_FIELD_GLYPH_SLOTS_1..6 (uint32 each). Per-class GlyphSlot.dbc record IDs
-            // pushed by Player::InitGlyphsForLevel on the legacy side. Each index determines
-            // (a) which UI position the V3_4_3 client renders, and (b) the Type (Major/Minor)
-            // it checks when applying a glyph. Previously HermesProxy fabricated {21..26},
-            // which sometimes mismatched what the legacy server actually has — leading the
-            // V3_4_3 client to route drag-drops to a wrong array index (e.g. dropping on a
-            // visibly empty Major slot sent Misc[0]=0, an already-filled slot).
-            PlayerField[] glyphSlotFields = {
-                PlayerField.PLAYER_FIELD_GLYPH_SLOTS_1, PlayerField.PLAYER_FIELD_GLYPH_SLOTS_2,
-                PlayerField.PLAYER_FIELD_GLYPH_SLOTS_3, PlayerField.PLAYER_FIELD_GLYPH_SLOTS_4,
-                PlayerField.PLAYER_FIELD_GLYPH_SLOTS_5, PlayerField.PLAYER_FIELD_GLYPH_SLOTS_6,
-            };
-            for (int gi = 0; gi < PlayerConst.MaxGlyphSlots; gi++)
-            {
-                int gIdx = LegacyVersion.GetUpdateField(glyphSlotFields[gi]);
-                if (gIdx >= 0 && updateMaskArray[gIdx])
-                {
-                    uint slotId = updates[gIdx].UInt32Value;
-                    if (GetSession().GameState.ActiveGlyphSlotIds[gi] != slotId)
-                    {
-                        GetSession().GameState.ActiveGlyphSlotIds[gi] = slotId;
-                        GetSession().GameState.ActiveGlyphsDirty = true;
-                        Log.Print(LogType.Network, $"[Glyphs] PLAYER_FIELD_GLYPH_SLOTS_{gi + 1} SlotID={slotId} (index {gi})");
-                    }
-                }
             }
             int PLAYER_TRACK_CREATURES = LegacyVersion.GetUpdateField(PlayerField.PLAYER_TRACK_CREATURES);
             if (PLAYER_TRACK_CREATURES >= 0 && updateMaskArray[PLAYER_TRACK_CREATURES])
@@ -3189,12 +2580,6 @@ public partial class WorldClient
             if (PLAYER_FIELD_COINAGE >= 0 && updateMaskArray[PLAYER_FIELD_COINAGE])
             {
                 updateData.ActivePlayerData.Coinage = updates[PLAYER_FIELD_COINAGE].UInt32Value;
-                if (ModernVersion.Build == ClientVersionBuild.V3_4_3_54261 &&
-                    guid == GetSession().GameState.CurrentPlayerGuid)
-                {
-                    Log.Print(LogType.Debug,
-                        $"[V343Trace][Coinage] player coinage={updates[PLAYER_FIELD_COINAGE].UInt32Value}");
-                }
             }
             int PLAYER_FIELD_POSSTAT0 = LegacyVersion.GetUpdateField(PlayerField.PLAYER_FIELD_POSSTAT0);
             if (PLAYER_FIELD_POSSTAT0 >= 0)
@@ -3314,9 +2699,6 @@ public partial class WorldClient
                 
                 updateData.ActivePlayerData.MultiActionBars = (byte)((updates[PLAYER_FIELD_BYTES].UInt32Value >> 16) & 0xFF);
                 updateData.ActivePlayerData.LifetimeMaxRank = (byte)((updates[PLAYER_FIELD_BYTES].UInt32Value >> 24) & 0xFF);
-                Log.Print(LogType.Trace,
-                    $"[ActionBarTrace] PLAYER_FIELD_BYTES extracted: MultiActionBars=0x{updateData.ActivePlayerData.MultiActionBars:X2} " +
-                    $"({System.Convert.ToString(updateData.ActivePlayerData.MultiActionBars.Value, 2).PadLeft(8, '0')}b) raw32=0x{updates[PLAYER_FIELD_BYTES].UInt32Value:X8} guid={guid}");
             }
             int PLAYER_AMMO_ID = LegacyVersion.GetUpdateField(PlayerField.PLAYER_AMMO_ID);
             if (PLAYER_AMMO_ID >= 0 && updateMaskArray[PLAYER_AMMO_ID])
@@ -3569,40 +2951,6 @@ public partial class WorldClient
         // GameObject Fields
         if (objectType == ObjectType.GameObject)
         {
-            Log.Print(LogType.Trace,
-                $"[Trace][GO ingest ENTER] guid={guid} entry={updateData.ObjectData.EntryID} " +
-                $"dynFlagsBefore={(updateData.ObjectData.DynamicFlags.HasValue ? "0x" + updateData.ObjectData.DynamicFlags.Value.ToString("X8") : "null")} " +
-                $"isTransport={guid.IsTransport()}");
-
-            // Diagnostic: dump every GAMEOBJECT_* field actually set in this incoming
-            // values-update mask, so we don't silently miss fields the current handler
-            // doesn't read. GO updates are infrequent vs Unit/Player so volume is fine.
-            foreach (GameObjectField goField in Enum.GetValues(typeof(GameObjectField)))
-            {
-                if (goField == GameObjectField.GAMEOBJECT_END) continue;
-                int idx = LegacyVersion.GetUpdateField(goField);
-                if (idx < 0 || idx >= updateMaskArray.Length) continue;
-                if (!updateMaskArray[idx]) continue;
-                Log.Print(LogType.Trace,
-                    $"[Trace][GO field in] guid={guid} {goField}@{idx} " +
-                    $"u32=0x{updates[idx].UInt32Value:X8} ({updates[idx].UInt32Value}) " +
-                    $"i32={updates[idx].Int32Value} f32={updates[idx].FloatValue}");
-            }
-
-            // V3_4_3 ObjectData::DynamicFlags for non-transport GameObjects is a pure
-            // GO_DYNFLAG_LO_* bitmask (low 16 bits, max 0x8000 = STATE_TRANSITION_ANIM_DONE).
-            // Anim/Path-progress is NOT in the high 16 bits — TC wotlk_classic's
-            // ViewerDependentValue<ObjectData::DynamicFlagsTag> computes a value made up of
-            // GO_DYNFLAG_LO_STATE_TRANSITION_ANIM_DONE plus per-viewer LO flags, then
-            // returns it directly. Sending high bits (e.g. legacy 3.3.5 AnimProgress=0xFFFF)
-            // makes the client interpret them as unknown LO flags and disconnect with
-            // reason=7 right after the next SMSG_UPDATE_OBJECT.
-            //
-            // Pre-V3_4_3 clients (V1_14, V2_5) keep the legacy WotLK convention where
-            // GAMEOBJECT_DYN_FLAGS high 16 bits hold AnimProgress, so we still seed
-            // 0xFFFF0000 for those builds — the field shape on the wire is unchanged
-            // from the legacy 3.3.5 representation. Transports preserve the full 32 bits
-            // on every build (TC v3.4.3 keeps the legacy semantics for transport GOs).
             const uint pathProgressMaxHi = 0xFFFF0000u;
             bool seedHighBits = ModernVersion.ExpansionVersion >= 3
                                 && ModernVersion.Build != ClientVersionBuild.V3_4_3_54261
@@ -3631,14 +2979,6 @@ public partial class WorldClient
                 updateData.GameObjectData.Flags = updates[GAMEOBJECT_FLAGS].UInt32Value;
             }
             int GAMEOBJECT_ROTATION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_ROTATION);
-            // Classic re-release legacy enums (V1_14, V2_5, V3_3_5a) renamed the
-            // 4-float rotation field to GAMEOBJECT_PARENTROTATION but the wire
-            // offset and semantics are identical. Without this fallback we never
-            // read rotation from cmangos / TC335 / AzerothCore — MoveInfo.Rotation
-            // stays at its initialized identity (or worse, default zeros under the
-            // pre-Identity default), which the V3_4_3 client treats as an invalid
-            // quaternion and rejects with CMSG_OBJECT_UPDATE_FAILED for the whole
-            // SMSG_UPDATE_OBJECT (collateral Player rejection from byte misalignment).
             if (GAMEOBJECT_ROTATION < 0)
                 GAMEOBJECT_ROTATION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_PARENTROTATION);
             if (GAMEOBJECT_ROTATION >= 0 && updateData.CreateData != null && updateData.CreateData.MoveInfo != null)
@@ -3648,29 +2988,20 @@ public partial class WorldClient
                     if (updateMaskArray[GAMEOBJECT_ROTATION + i])
                         updateData.CreateData.MoveInfo.Rotation[i] = updates[GAMEOBJECT_ROTATION + i].FloatValue;
                 }
-                // Sanitize: if the server sent all-zero rotation, snap to identity
-                // so the client doesn't reject a non-unit quaternion.
+
                 var r = updateData.CreateData.MoveInfo.Rotation;
                 if (r.X == 0f && r.Y == 0f && r.Z == 0f && r.W == 0f)
                     updateData.CreateData.MoveInfo.Rotation = Quaternion.Identity;
 
-                // V3_4_3 split rotation into two distinct fields:
-                //   1. GameObjectData.ParentRotation — the stored placement quaternion
-                //   2. MovementUpdate HasRotation block — the live world-space rotation
-                // CypherCore reference for entry 191747 (Acherus Runeforge) shows these
-                // can disagree: ParentRotation=(0,0,0.292,0.956) (cMangos's quaternion)
-                // vs live Rotation=(0,0,-0.472,0.882) (derived from orientation 5.3 rad).
-                // cMangos's GAMEOBJECT_PARENTROTATION is the right value for ParentRotation;
-                // for live Rotation we re-derive from MoveInfo.Position.Orientation so the
-                // visible facing matches the orientation field (cMangos's stored quaternion
-                // is desynced for some entries — runeforge faces 34° instead of 304°).
                 if (ModernVersion.ExpansionVersion >= 3)
                 {
-                    var rot = updateData.CreateData.MoveInfo.Rotation;
-                    updateData.GameObjectData.ParentRotation = new float?[] { rot.X, rot.Y, rot.Z, rot.W };
-
-                    float ori = updateData.CreateData.MoveInfo.Orientation;
-                    updateData.CreateData.MoveInfo.Rotation = Quaternion.CreateFromAxisAngle(Vector3.UnitZ, ori);
+                    var parentRotation = updateData.CreateData.MoveInfo.Rotation;
+                    updateData.GameObjectData.ParentRotation = new float?[]
+                    {
+                        parentRotation.X, parentRotation.Y, parentRotation.Z, parentRotation.W
+                    };
+                    updateData.CreateData.MoveInfo.Rotation = Quaternion.CreateFromAxisAngle(
+                        Vector3.UnitZ, updateData.CreateData.MoveInfo.Orientation);
                 }
 
                 // Fix for invalid movement of Deeprun Tram, some carts were going through the wall (in the opposite direction)
@@ -3715,30 +3046,13 @@ public partial class WorldClient
                     }
                 }
             }
-            // 3.3.5a packs four bytes into the GAMEOBJECT_BYTES_1 uint32:
-            //   byte 0 = State, byte 1 = TypeID, byte 2 = ArtKit, byte 3 = AnimProgress
-            // cmangos / TC335 / AzerothCore ship the packed field instead of the per-byte
-            // individual UpdateFields, so without this unpacker State and TypeID stay null
-            // and WriteCreateGameObjectData writes TypeID=0 (= GAMEOBJECT_TYPE_DOOR). The
-            // V3_4_3 client then rejects the create with CMSG_OBJECT_UPDATE_FAILED, taking
-            // out other objects in the same SMSG_UPDATE_OBJECT (incl. the player) via byte
-            // misalignment. Per fork research:
-            //   X:\Programming\HermesProxy-WOTLK\research\transport_crash_investigation.md
-            // The TC343 GameObjectData renamed byte 3 from AnimProgress -> PercentHealth.
             int GAMEOBJECT_BYTES_1 = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_BYTES_1);
             if (GAMEOBJECT_BYTES_1 >= 0 && updateMaskArray[GAMEOBJECT_BYTES_1])
             {
                 uint packed = updates[GAMEOBJECT_BYTES_1].UInt32Value;
-                updateData.GameObjectData.State         = (sbyte)(packed & 0xFF);
-                updateData.GameObjectData.TypeID        = (sbyte)((packed >> 8) & 0xFF);
-                updateData.GameObjectData.ArtKit        = (byte)((packed >> 16) & 0xFF);
-                // V3_4_3.54261 renamed the byte-3 slot from AnimProgress (0..255 anim
-                // phase) to PercentHealth (0..100 destructible HP); the legacy server's
-                // AnimProgress value (e.g. 255/149/110 for static chests) reads as invalid
-                // HP and the V3_4_3 client may treat the GO as damaged/destroyed and
-                // refuse interaction. For 3.4.3 we drop the byte entirely and let the
-                // writer's `?? 0` fallback emit 0. V1_14 / V2_5 still use the legacy
-                // AnimProgress semantics, so propagate byte 3 unchanged for those builds.
+                updateData.GameObjectData.State = (sbyte)(packed & 0xFF);
+                updateData.GameObjectData.TypeID = (sbyte)((packed >> 8) & 0xFF);
+                updateData.GameObjectData.ArtKit = (byte)((packed >> 16) & 0xFF);
                 if (ModernVersion.Build != ClientVersionBuild.V3_4_3_54261)
                     updateData.GameObjectData.PercentHealth = (byte)((packed >> 24) & 0xFF);
             }
@@ -3748,52 +3062,23 @@ public partial class WorldClient
                 updateData.GameObjectData.State = (sbyte)updates[GAMEOBJECT_STATE].Int32Value;
             }
             int GAMEOBJECT_DYN_FLAGS = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_DYN_FLAGS);
-            // V3_3_5a (cMangos / TrinityCore wotlk_classic) renamed the field to
-            // GAMEOBJECT_DYNAMIC. Wire offset and semantics are identical to
-            // V1_12 / V2_4_3 GAMEOBJECT_DYN_FLAGS — without this fallback the
-            // legacy server's per-player Activate/Sparkle bits are silently
-            // dropped, which makes quest GameObjects (chests, herbs, etc.)
-            // appear inert on the V3_4_3 client.
             if (GAMEOBJECT_DYN_FLAGS < 0)
                 GAMEOBJECT_DYN_FLAGS = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_DYNAMIC);
             if (GAMEOBJECT_DYN_FLAGS >= 0 && updateMaskArray[GAMEOBJECT_DYN_FLAGS])
             {
                 uint legacyRaw = updates[GAMEOBJECT_DYN_FLAGS].UInt32Value;
-
-                // V3_4_3 non-transport GO ObjectData::DynamicFlags is a low-16-bit
-                // GO_DYNFLAG_LO_* bitmask only — high 16 bits in legacy 3.3.5 hold
-                // AnimProgress and have no V3_4_3 equivalent in this field. Strip them
-                // so the client sees a valid bitmask (otherwise it disconnects with
-                // reason=7 right after consuming the SMSG_UPDATE_OBJECT).
                 bool stripHighBits = ModernVersion.Build == ClientVersionBuild.V3_4_3_54261
                                      && !guid.IsTransport();
                 uint effectiveLegacyRaw = stripHighBits ? (legacyRaw & 0x0000FFFFu) : legacyRaw;
 
                 uint oldValue = 0;
-                string oldDynSource;
                 if (updateData.ObjectData.DynamicFlags != null)
-                {
                     oldValue = (uint)updateData.ObjectData.DynamicFlags;
-                    oldDynSource = "cache";
-                }
                 else if (!guid.IsTransport() && ModernVersion.Build != ClientVersionBuild.V3_4_3_54261)
-                {
-                    // Pre-V3_4_3 clients still expect AnimProgress in the high 16 bits.
                     oldValue = 4294901760;
-                    oldDynSource = "fallback";
-                }
-                else
-                {
-                    oldDynSource = stripHighBits ? "v343NoSeed" : "transport0";
-                }
 
                 GameObjectDynamicFlagsLegacy flags = (GameObjectDynamicFlagsLegacy)effectiveLegacyRaw;
-                uint newLow = (uint)flags.CastFlags<GameObjectDynamicFlagsModern>();
-                updateData.ObjectData.DynamicFlags = (oldValue | newLow);
-                Log.Print(LogType.Trace,
-                    $"[Trace][GO DYN_FLAGS] guid={guid} entry={updateData.ObjectData.EntryID} " +
-                    $"legacyRaw=0x{legacyRaw:X8} effective=0x{effectiveLegacyRaw:X8} ({flags}) " +
-                    $"-> modernLow=0x{newLow:X8}, oldDyn=0x{oldValue:X8} oldDynSource={oldDynSource}, finalDyn=0x{updateData.ObjectData.DynamicFlags.Value:X8}");
+                updateData.ObjectData.DynamicFlags = (oldValue | (uint)flags.CastFlags<GameObjectDynamicFlagsModern>());
             }
             int GAMEOBJECT_FACTION = LegacyVersion.GetUpdateField(GameObjectField.GAMEOBJECT_FACTION);
             if (GAMEOBJECT_FACTION >= 0 && updateMaskArray[GAMEOBJECT_FACTION])
@@ -3910,49 +3195,5 @@ public partial class WorldClient
                 updateData.CorpseData.DynamicFlags = updates[CORPSE_FIELD_DYNAMIC_FLAGS].UInt32Value;
             }
         }
-    }
-
-    // Dump the rendering-relevant Values fields for NPCBot creatures so we can debug the
-    // "hired bot is invisible until I mount" reports. Triggered for any Creature CreateObject
-    // whose legacy entry sits in the NPCBot range (>= 70000) so the trace stays quiet for
-    // regular world creatures.
-    private static void TraceNpcBotCreateObject(string source, WowGuid64 oldGuid, WowGuid128 guid, ObjectUpdate updateData)
-    {
-        // Cheap gates first — bail before doing any string work when the trace sink is off
-        // or the object isn't in the NPCBot entry range.
-        if (!Log.IsTraceEnabled)
-            return;
-
-        if (oldGuid.GetHighType() != HighGuidType.Creature)
-            return;
-
-        uint entry = oldGuid.GetEntry();
-        if (entry < 70000)
-            return;
-
-        var u = updateData.UnitData;
-        var o = updateData.ObjectData;
-        var pos = updateData.CreateData?.MoveInfo?.Position;
-
-        Log.Print(LogType.Trace,
-            $"[NpcBotTrace][{source}] guid={guid} entry={entry} " +
-            $"DisplayID={u?.DisplayID?.ToString() ?? "null"} " +
-            $"NativeDisplayID={u?.NativeDisplayID?.ToString() ?? "null"} " +
-            $"MountDisplayID={u?.MountDisplayID?.ToString() ?? "null"} " +
-            $"Race={u?.RaceId?.ToString() ?? "null"} " +
-            $"Class={u?.ClassId?.ToString() ?? "null"} " +
-            $"Sex={u?.SexId?.ToString() ?? "null"} " +
-            $"Faction={u?.FactionTemplate?.ToString() ?? "null"} " +
-            $"Flags=0x{(u?.Flags ?? 0):X8} " +
-            $"Flags2=0x{(u?.Flags2 ?? 0):X8} " +
-            $"Bounding={u?.BoundingRadius?.ToString("F3") ?? "null"} " +
-            $"CombatReach={u?.CombatReach?.ToString("F3") ?? "null"} " +
-            $"Scale={o?.Scale?.ToString("F3") ?? "null"} " +
-            $"DynFlags=0x{(o?.DynamicFlags ?? 0):X8} " +
-            $"CreatedBy={u?.CreatedBy?.ToString() ?? "null"} " +
-            $"SummonedBy={u?.SummonedBy?.ToString() ?? "null"} " +
-            $"Charm={u?.Charm?.ToString() ?? "null"} " +
-            $"CharmedBy={u?.CharmedBy?.ToString() ?? "null"} " +
-            $"Pos=({pos?.X.ToString("F2") ?? "?"},{pos?.Y.ToString("F2") ?? "?"},{pos?.Z.ToString("F2") ?? "?"})");
     }
 }

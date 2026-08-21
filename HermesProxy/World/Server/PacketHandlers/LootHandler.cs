@@ -51,8 +51,9 @@ public partial class WorldSocket
     {
         WorldPacket packet = new WorldPacket(Opcode.CMSG_LOOT_UNIT);
         packet.WriteGuid(loot.Unit.To64());
-        SendPacketToServer(packet);
-        GetSession().GameState.LastLootTargetGuid = loot.Unit.To64();
+        GetSession().GameState.LootTargetState.BeginRequest(
+            loot.Unit.To64(),
+            () => SendPacketToServer(packet));
     }
 
     [PacketHandler(Opcode.CMSG_LOOT_MONEY)]

@@ -15,6 +15,7 @@ using System.Text;
 using System.Threading;
 using Framework.Realm;
 using ArenaTeamInspectData = HermesProxy.World.Server.Packets.ArenaTeamInspectData;
+using Framework.Metrics;
 using System;
 
 namespace HermesProxy;
@@ -53,6 +54,7 @@ public sealed class PendingObjectUpdate
     public required UpdateObject UpdateObject;
     public required List<AuraUpdate> AuraUpdates;
     public required HashSet<uint> WaitingForItemIds;
+    public DateTimeOffset EnqueuedAtUtc { get; init; } = DateTimeOffset.UtcNow;
 }
 
 // Death Knight rune snapshot. Allocated only for DK players on V3_4_3, where
@@ -172,7 +174,12 @@ public sealed class GameSessionData
     public ClientCastRequest? CurrentClientNextMeleeCast; // next melee spells (Raptor Strike, Heroic Strike, etc.)
     public ClientCastRequest? CurrentClientAutoRepeatCast; // auto repeat spells (Auto Shot, Shoot, etc.)
     public ConcurrentQueue<ClientCastRequest> PendingPetCasts = new();  // pet spell casts (queue for proper FIFO handling)
-    public WowGuid64 LastLootTargetGuid;
+    public readonly LootTargetState LootTargetState = new();
+    public WowGuid64 LastLootTargetGuid
+    {
+        get => LootTargetState.Current;
+        set => LootTargetState.Set(value);
+    }
     public List<WowGuid128>? MasterLootCandidates;
     public WowGuid64 LastMasterLootSentTarget;
     // V3_4_3 only: legacy 3.3.5a backends emit SMSG_LOOT_RELEASE mid-drain (after each
@@ -813,6 +820,21 @@ public sealed class GameSessionData
     }
 
     /// <summary>
+    /// Try to find and dequeue an own cast that the server has reported as failed.
+    /// Failure packets for other units must not consume the local cast queue.
+    /// </summary>
+    public bool TryDequeueOwnPendingNormalCast(WowGuid128 casterUnit, uint spellId, out ClientCastRequest? cast)
+    {
+        if (CurrentPlayerGuid != casterUnit)
+        {
+            cast = null;
+            return false;
+        }
+
+        return TryDequeuePendingNormalCast(spellId, out cast);
+    }
+
+    /// <summary>
     /// Match a pending cast against an incoming server spellId, accepting either
     /// the modern (client-sent) SpellId or the LegacySpellId we resolved at item-use time.
     /// Needed for SoM 1.14.1+ items where Blizzard renumbered the on-use spell id
@@ -1327,6 +1349,11 @@ public class GlobalSessionData
     // CreateObject content against TC's reference parse for the V3_4_3 canary investigation.
     public SniffFile LegacySniff = null!;
 
+    // Modern realm and instance sockets plus the legacy receive loop all mutate
+    // one GameSessionData. This lock gives packet handlers one per-session order.
+    public readonly Lock PacketOrderLock = new();
+    private readonly Dictionary<ProxyFlow, Queue<ProxyLifecycle>> _pendingProxyLifecycles = [];
+
     public Dictionary<string, WowGuid128> GuildsByName = [];
     public Dictionary<uint, List<string>> GuildRanks = [];
 
@@ -1356,6 +1383,46 @@ public class GlobalSessionData
 
         RealmManager = new RealmManager(clientOptions, networkOptions);
         GameState = GameSessionData.CreateNewGameSessionData(this);
+    }
+
+    public void RegisterProxyLifecycle(ProxyFlow flow, ProxyLifecycle lifecycle)
+    {
+        lock (PacketOrderLock)
+        {
+            if (!_pendingProxyLifecycles.TryGetValue(flow, out var pending))
+            {
+                pending = new Queue<ProxyLifecycle>();
+                _pendingProxyLifecycles.Add(flow, pending);
+            }
+
+            pending.Enqueue(lifecycle);
+        }
+    }
+
+    public ProxyLifecycle? TakeProxyLifecycle(params ProxyFlow[] flows)
+    {
+        lock (PacketOrderLock)
+        {
+            ProxyFlow? selectedFlow = null;
+            ProxyLifecycle? selectedLifecycle = null;
+            foreach (var flow in flows)
+            {
+                if (_pendingProxyLifecycles.TryGetValue(flow, out var pending) &&
+                    pending.TryPeek(out var lifecycle) &&
+                    (selectedLifecycle == null || lifecycle.Id < selectedLifecycle.Id))
+                {
+                    selectedFlow = flow;
+                    selectedLifecycle = lifecycle;
+                }
+            }
+
+            if (selectedFlow is ProxyFlow selectedFlowValue &&
+                _pendingProxyLifecycles.TryGetValue(selectedFlowValue, out var selectedPending) &&
+                selectedPending.TryDequeue(out var result))
+                return result;
+
+            return null;
+        }
     }
     
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
