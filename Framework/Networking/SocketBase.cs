@@ -42,6 +42,9 @@ public abstract class SocketBase : ISocket, IDisposable
     byte[]? _callbackBuffer;
     byte[]? _asyncBuffer;
     const int BufferSize = 0x4000;
+    const int MaxQueuedWriteItems = 256;
+    const int MaxQueuedWriteBytes = 4 * 1024 * 1024;
+    readonly BoundedSocketWriteQueue _writeQueue;
 
     public delegate void SocketReadCallback(SocketAsyncEventArgs args);
 
@@ -49,6 +52,11 @@ public abstract class SocketBase : ISocket, IDisposable
     {
         _socket = socket;
         _remoteIPEndPoint = _socket.RemoteEndPoint as IPEndPoint;
+        _writeQueue = new BoundedSocketWriteQueue(
+            (data, cancellationToken) => _socket.SendAsync(data, SocketFlags.None, cancellationToken),
+            MaxQueuedWriteItems,
+            MaxQueuedWriteBytes,
+            HandleWriteQueueFailure);
 
         _callbackBuffer = ArrayPool<byte>.Shared.Rent(BufferSize);
         _asyncBuffer = ArrayPool<byte>.Shared.Rent(BufferSize);
@@ -63,6 +71,7 @@ public abstract class SocketBase : ISocket, IDisposable
 
     public virtual void Dispose()
     {
+        _writeQueue.Dispose();
         _socket.Dispose();
 
         if (_callbackBuffer != null)
@@ -133,12 +142,47 @@ public abstract class SocketBase : ISocket, IDisposable
 
     public abstract void ReadHandler(SocketAsyncEventArgs args);
 
-    public void AsyncWrite(byte[] data)
+    public void AsyncWrite(byte[] data, Action? onSent = null)
     {
         if (!IsOpen())
             return;
 
-        _socket.Send(data);
+        _writeQueue.TryEnqueue(data, onSent);
+    }
+
+    /// <summary>
+    /// Writes one protocol-critical packet before returning. The modern client expects
+    /// the realm/character-select handshake to be available as one ordered stream; the
+    /// normal bounded queue remains the low-latency path for gameplay traffic.
+    /// </summary>
+    protected void SynchronousWrite(byte[] data, Action? onSent = null)
+    {
+        if (!IsOpen())
+            return;
+
+        try
+        {
+            int offset = 0;
+            while (offset < data.Length)
+            {
+                int sent = _socket.Send(data, offset, data.Length - offset, SocketFlags.None);
+                if (sent <= 0)
+                    throw new SocketException((int)SocketError.ConnectionReset);
+                offset += sent;
+            }
+
+            onSent?.Invoke();
+        }
+        catch (Exception exception)
+        {
+            HandleWriteQueueFailure(exception);
+        }
+    }
+
+    private void HandleWriteQueueFailure(Exception exception)
+    {
+        Log.Print(LogType.Network, $"Socket write queue failed for {GetRemoteIpAddress()}: {exception.Message}");
+        CloseSocket();
     }
 
     public void CloseSocket()
@@ -166,5 +210,10 @@ public abstract class SocketBase : ISocket, IDisposable
     public void SetNoDelay(bool enable)
     {
         _socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, enable);
+    }
+
+    public bool GetNoDelay()
+    {
+        return _socket.NoDelay;
     }
 }

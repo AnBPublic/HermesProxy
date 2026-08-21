@@ -32,12 +32,11 @@ public sealed class WorldSocketManager : SocketManager<WorldSocket>
         : base(services)
     {
         _instancePort = networkOptions.Value.InstancePort;
+        _tcpNoDelay = networkOptions.Value.ForceTcpNoDelay;
     }
 
     public override bool StartNetwork(string bindIp, int realmPort, int threadCount = 1)
     {
-        _tcpNoDelay = true;
-
         // -1 means use default
         _socketSendBufferSize = -1;
 
@@ -76,6 +75,7 @@ public sealed class WorldSocketManager : SocketManager<WorldSocket>
 
             // Set TCP_NODELAY.
             sock.NoDelay = _tcpNoDelay;
+            Log.Print(LogType.Network, $"WorldSocketManager: TCP_NODELAY={sock.NoDelay} (forced={_tcpNoDelay})");
         }
         catch (SocketException ex)
         {

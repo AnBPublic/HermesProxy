@@ -11,6 +11,7 @@ using Framework.Constants;
 using Framework;
 using Framework.IO;
 using Framework.Logging;
+using Framework.Metrics;
 using HermesProxy.World.Enums;
 using System.Reflection;
 using System.Threading.Tasks;
@@ -59,13 +60,15 @@ public partial class WorldClient
     FrozenDictionary<Opcode, Action<WorldPacket>> _packetHandlers = null!;
     GlobalSessionData _globalSession = null!;
     readonly Lock _sendLock = new();
+    readonly Lock _delayedPacketsLock = new();
+    readonly AsyncLocal<ProxyLifecycle?> _activeLifecycle = new();
     Timer? _keepAliveTimer;
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
 
     // packet order is not always the same as new client, sometimes we need to delay packet until another one
-    Dictionary<Opcode, List<WorldPacket>> _delayedPacketsToServer = null!;
-    Dictionary<Opcode, List<ServerPacket>> _delayedPacketsToClient = null!;
+    Dictionary<Opcode, OrderedPacketQueue<WorldPacket>> _delayedPacketsToServer = null!;
+    Dictionary<Opcode, OrderedPacketQueue<ServerPacket>> _delayedPacketsToClient = null!;
 
     public WorldClient()
     {
@@ -79,41 +82,6 @@ public partial class WorldClient
 
     public GlobalSessionData Session => _globalSession;
 
-    // Writes a legacy packet to the per-session legacy .pkt sniff (the cMangos↔HermesProxy stream).
-    // SMSG (isFromClient=false) bodies have no opcode prefix — pass through directly. CMSG
-    // (isFromClient=true) bodies also have no prefix in our WorldPacket abstraction, but
-    // SniffFile.WritePacket expects a 2-byte prefix to strip on the client path; we prepend two
-    // zero bytes so it strips them and writes the original body intact.
-    private void WriteLegacySniff(WorldPacket packet, bool isFromClient)
-    {
-        var session = _globalSession;
-        if (session == null)
-            return;
-
-        var sniff = session.LegacySniff;
-        if (sniff == null)
-        {
-            sniff = new SniffFile("legacy", (ushort)LegacyVersion.Build);
-            sniff.WriteHeader();
-            session.LegacySniff = sniff;
-            Log.Print(LogType.Trace, $"Opened legacy sniff file: {sniff.FilePath}");
-        }
-
-        ReadOnlySpan<byte> body = packet.GetData();
-        uint opcode = packet.GetOpcode();
-
-        if (isFromClient)
-        {
-            byte[] prefixed = new byte[body.Length + 2];
-            body.CopyTo(prefixed.AsSpan(2));
-            sniff.WritePacket(opcode, true, prefixed);
-        }
-        else
-        {
-            sniff.WritePacket(opcode, false, body);
-        }
-    }
-
     public bool ConnectToWorldServer(Realm realm, GlobalSessionData globalSession)
     {
         _worldCrypt = null!;
@@ -121,8 +89,8 @@ public partial class WorldClient
         _globalSession = globalSession;
         _username = globalSession.Username;
         _isSuccessful = null;
-        _delayedPacketsToServer = new Dictionary<Opcode, List<WorldPacket>>();
-        _delayedPacketsToClient = new Dictionary<Opcode, List<ServerPacket>>();
+        _delayedPacketsToServer = new Dictionary<Opcode, OrderedPacketQueue<WorldPacket>>();
+        _delayedPacketsToClient = new Dictionary<Opcode, OrderedPacketQueue<ServerPacket>>();
 
         WorldClientLogMessages.ConnectingToWorldServer(_melNet, _sourceFile, _netDirNone);
         try
@@ -198,6 +166,11 @@ public partial class WorldClient
         _clientSocket?.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, enable);
     }
 
+    public bool? GetNoDelay()
+    {
+        return _clientSocket?.NoDelay;
+    }
+
     public uint GetQueuePosition()
     {
         return _queuePosition;
@@ -211,13 +184,16 @@ public partial class WorldClient
 
             _clientSocket.EndConnect(AR);
             _clientSocket.ReceiveBufferSize = 65535;
-            _clientSocket.NoDelay = true;
+            bool forceNoDelay = _globalSession.NetworkOptions.ForceTcpNoDelay;
+            _clientSocket.NoDelay = forceNoDelay;
+            Log.Print(LogType.Network, $"Legacy world socket TCP_NODELAY={_clientSocket.NoDelay} (forced={forceNoDelay})");
 
             _ = Task.Run(ReceiveLoop);
         }
         catch (Exception ex)
         {
             Log.Print(LogType.Error, $"Connect Error: {ex.Message}");
+            HermesProxy.Server.Telemetry?.Record("connection_unexpected_disconnect", "server_to_client", null, $"connect={ex.GetType().Name}");
             if (_isSuccessful == null)
                 _isSuccessful = false;
         }
@@ -248,6 +224,7 @@ public partial class WorldClient
     private void HandleDisconnect(string reason)
     {
         Log.PrintNet(LogType.Error, LogNetDir.S2P, $"Socket Closed By GameWorldServer ({reason})");
+        HermesProxy.Server.Telemetry?.Record("connection_unexpected_disconnect", "server_to_client", null, reason);
         if (_isSuccessful == null)
         {
             _isSuccessful = false;
@@ -331,7 +308,7 @@ public partial class WorldClient
     // server forcibly closed the connection after our CMSG_AUTH_SESSION when SendPacket
     // hopped onto a SendLoopAsync task. Until that interaction is understood, the legacy
     // outbound path stays synchronous-under-lock. The Wave 1 `using ByteBuffer` is kept.
-    private void SendPacket(WorldPacket packet)
+    private void SendPacket(WorldPacket packet, ProxyLifecycle? lifecycle = null)
     {
         lock (_sendLock)
         {
@@ -344,13 +321,7 @@ public partial class WorldClient
                 header.Opcode = packet.GetOpcode();
                 header.Write(buffer);
 
-                Opcode universalSendOpcode = LegacyVersion.GetUniversalOpcode(header.Opcode);
-                if (NoisyOpcodes.IsNoisy(universalSendOpcode))
-                    WorldClientLogMessages.PacketSentNoisy(_melLog, _sourceFile, _netDirSend, universalSendOpcode, header.Opcode, header.Size);
-                else
-                    WorldClientLogMessages.PacketSent(_melLog, _sourceFile, _netDirSend, universalSendOpcode, header.Opcode, header.Size);
-
-                WriteLegacySniff(packet, isFromClient: true);
+                WorldClientLogMessages.PacketSent(_melLog, _sourceFile, _netDirSend, LegacyVersion.GetUniversalOpcode(header.Opcode), header.Opcode, header.Size);
 
                 byte[] headerArray = buffer.GetData();
                 if (_worldCrypt != null)
@@ -360,7 +331,9 @@ public partial class WorldClient
 
                 buffer.WriteBytes(packet.GetData(), packet.GetSize());
 
-                _clientSocket.Send(buffer.GetData(), SocketFlags.None);
+                SendAll(buffer.GetData());
+                if (lifecycle != null && HermesProxy.Server.MetricsEnabled)
+                    HermesProxy.Server.Metrics.MarkLegacySent(lifecycle);
             }
             catch (Exception ex)
             {
@@ -371,27 +344,44 @@ public partial class WorldClient
         }
     }
 
-    public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
+    private void SendAll(byte[] data)
     {
-        Opcode opcode = packet.GetUniversalOpcode();
-        if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
+        int offset = 0;
+        while (offset < data.Length)
         {
-            if (_delayedPacketsToClient.ContainsKey(delayUntilOpcode))
-                _delayedPacketsToClient[delayUntilOpcode].Add(packet);
-            else
-            {
-                List<ServerPacket> packets = new List<ServerPacket>();
-                packets.Add(packet);
-                _delayedPacketsToClient.Add(delayUntilOpcode, packets);
-            }
-            return;
+            int sent = _clientSocket.Send(data, offset, data.Length - offset, SocketFlags.None);
+            if (sent <= 0)
+                throw new SocketException((int)SocketError.ConnectionReset);
+            offset += sent;
         }
-
-        SendPacketToClientDirect(packet);
-        SendDelayedPacketsToClientOnOpcode(opcode);
     }
 
-    private void SendPacketToClientDirect(ServerPacket packet)
+    public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
+    {
+        lock (GetSession().PacketOrderLock)
+        {
+            Opcode opcode = packet.GetUniversalOpcode();
+            if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
+            {
+                lock (_delayedPacketsLock)
+                {
+                    if (!_delayedPacketsToClient.TryGetValue(delayUntilOpcode, out var packets))
+                    {
+                        packets = new OrderedPacketQueue<ServerPacket>();
+                        _delayedPacketsToClient.Add(delayUntilOpcode, packets);
+                    }
+
+                    packets.Enqueue(packet);
+                }
+                return;
+            }
+
+            SendPacketToClientDirect(packet, _activeLifecycle.Value);
+            SendDelayedPacketsToClientOnOpcode(opcode);
+        }
+    }
+
+    private void SendPacketToClientDirect(ServerPacket packet, ProxyLifecycle? lifecycle = null)
     {
         var gameState = GetSession().GameState;
         var pendingPackets = gameState.PendingUninstancedPackets;
@@ -417,92 +407,84 @@ public partial class WorldClient
                 }
             }
 
-            GetSession().RealmSocket.SendPacket(packet);
+            GetSession().RealmSocket.SendPacket(packet, lifecycle);
         }
         else
         {
-            if (GetSession().InstanceSocket == null &&
-               !gameState.IsConnectedToInstance)
+            World.Server.WorldSocket? socket;
+            lock (pendingLock)
             {
-                lock (pendingLock)
+                socket = GetSession().InstanceSocket;
+                if (socket == null)
                 {
-                    if (GetSession().InstanceSocket == null &&
-                        !gameState.IsConnectedToInstance)
-                    {
-                        pendingPackets.Enqueue(packet);
-                        Log.PrintNet(LogType.Warn, LogNetDir.P2C, $"Can't send opcode {packet.GetUniversalOpcode()} ({packet.GetOpcode()}) before entering world! Queue");
-                        return;
-                    }
+                    pendingPackets.Enqueue(packet);
+                    Log.PrintNet(LogType.Warn, LogNetDir.P2C, $"Can't send opcode {packet.GetUniversalOpcode()} ({packet.GetOpcode()}) before entering world! Queue");
+                    return;
                 }
-            }
 
-            // block these packets until connected to instance
-            while (GetSession().InstanceSocket == null)
-            {
-                Log.PrintNet(LogType.Network, LogNetDir.P2C, $"Waiting to send {packet.GetUniversalOpcode()} ({packet.GetOpcode()}).");
-                System.Threading.Thread.Sleep(200);
-            }
-
-            var socket = GetSession().InstanceSocket;
-            if (pendingPackets.Count > 0)
-            {
-                lock (pendingLock)
+                while (pendingPackets.TryDequeue(out var oldPacket))
                 {
-                    while (pendingPackets.TryDequeue(out var oldPacket))
-                    {
-                        socket.SendPacket(oldPacket);
-                    }
+                    socket.SendPacket(oldPacket);
                 }
-            }
 
-            socket.SendPacket(packet);
-        }
-    }
-
-    public void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
-    {
-        Opcode opcode = packet.GetUniversalOpcode(false);
-        if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
-        {
-            if (_delayedPacketsToServer.ContainsKey(delayUntilOpcode))
-                _delayedPacketsToServer[delayUntilOpcode].Add(packet);
-            else
-            {
-                List<WorldPacket> packets = new List<WorldPacket>();
-                packets.Add(packet);
-                _delayedPacketsToServer.Add(delayUntilOpcode, packets);
-            }
-            return;
-        }
-
-        SendPacket(packet);
-        SendDelayedPacketsToServerOnOpcode(opcode);
-    }
-
-    private void SendDelayedPacketsToServerOnOpcode(Opcode opcode)
-    {
-        if (_delayedPacketsToServer.ContainsKey(opcode))
-        {
-            List<WorldPacket> packets = _delayedPacketsToServer[opcode];
-            for (int i = packets.Count - 1; i >= 0; i--)
-            {
-                SendPacket(packets[i]);
-                packets.RemoveAt(i);
+                socket.SendPacket(packet, lifecycle);
             }
         }
     }
 
     private void SendDelayedPacketsToClientOnOpcode(Opcode opcode)
     {
-        if (_delayedPacketsToClient.ContainsKey(opcode))
+        OrderedPacketQueue<ServerPacket>? packets;
+        lock (_delayedPacketsLock)
         {
-            List<ServerPacket> packets = _delayedPacketsToClient[opcode];
-            for (int i = packets.Count - 1; i >= 0; i--)
-            {
-                SendPacketToClientDirect(packets[i]);
-                packets.RemoveAt(i);
-            }
+            if (!_delayedPacketsToClient.TryGetValue(opcode, out packets))
+                return;
+
+            _delayedPacketsToClient.Remove(opcode);
         }
+
+        foreach (var packet in packets.Drain())
+            SendPacketToClientDirect(packet, _activeLifecycle.Value);
+    }
+
+    public void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION, ProxyLifecycle? lifecycle = null)
+    {
+        lock (GetSession().PacketOrderLock)
+        {
+            Opcode opcode = packet.GetUniversalOpcode(false);
+            if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
+            {
+                lock (_delayedPacketsLock)
+                {
+                    if (!_delayedPacketsToServer.TryGetValue(delayUntilOpcode, out var packets))
+                    {
+                        packets = new OrderedPacketQueue<WorldPacket>();
+                        _delayedPacketsToServer.Add(delayUntilOpcode, packets);
+                    }
+
+                    packets.Enqueue(packet);
+                }
+                return;
+            }
+
+            SendPacket(packet, lifecycle);
+            SendDelayedPacketsToServerOnOpcode(opcode);
+        }
+    }
+
+    private void SendDelayedPacketsToServerOnOpcode(Opcode opcode)
+    {
+        OrderedPacketQueue<WorldPacket>? packets;
+        lock (_delayedPacketsLock)
+        {
+            if (!_delayedPacketsToServer.TryGetValue(opcode, out packets))
+                return;
+
+            _delayedPacketsToServer.Remove(opcode);
+        }
+
+        foreach (var packet in packets.Drain())
+            SendPacket(packet, _activeLifecycle.Value);
     }
 
     // Opcodes the legacy server may legitimately send before SMSG_AUTH_RESPONSE
@@ -517,81 +499,92 @@ public partial class WorldClient
 
     private void HandlePacket(WorldPacket packet)
     {
-        Opcode universalOpcode = packet.GetUniversalOpcode(false);
-        if (NoisyOpcodes.IsNoisy(universalOpcode))
-            WorldClientLogMessages.PacketReceivedNoisy(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
-        else
+        lock (GetSession().PacketOrderLock)
+        {
+            Opcode universalOpcode = packet.GetUniversalOpcode(false);
             WorldClientLogMessages.PacketReceived(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
 
-        WriteLegacySniff(packet, isFromClient: false);
-
-        // Trace-level enrichment for the legacy 3.3.5a SMSG_UPDATE_OBJECT envelope.
-        // Layout: u32 NumObjUpdates, [optional u8 hasTransport in 3.3.5a+], then per-update body.
-        // Peek bytes without advancing the read cursor — paired with the modern outgoing
-        // trace line, this lets us correlate "what came in" with "what went out".
-        if (universalOpcode == Opcode.SMSG_UPDATE_OBJECT)
-        {
-            byte[] raw = packet.GetData();
-            uint numObjUpdates = raw.Length >= 4
-                ? (uint)(raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24))
-                : 0u;
-            byte hasTransport = raw.Length >= 5 ? raw[4] : (byte)0;
-            int hexLen = System.Math.Min(48, raw.Length);
-            string hex = System.BitConverter.ToString(raw, 0, hexLen);
-            // First per-object byte (offset 5) is UpdateTypeLegacy (0=Values, 1=Movement,
-            // 2=CreateObject1, 3=CreateObject2, 4=NearObjects, 5=FarObjects). Decode for
-            // quick eyeballing of the burst type.
-            string firstUpdateType = "n/a";
-            if (raw.Length > 5)
+            long startTimestamp = HermesProxy.Server.MetricsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            ProxyLifecycle? lifecycle = null;
+            var responseFlow = ProxyFlowClassifier.ForLegacyResponse(universalOpcode);
+            if (HermesProxy.Server.MetricsEnabled && responseFlow is ProxyFlow flow)
             {
-                byte t = raw[5];
-                firstUpdateType = t switch
+                lifecycle = flow switch
                 {
-                    0 => "Values",
-                    1 => "Movement",
-                    2 => "CreateObject1",
-                    3 => "CreateObject2",
-                    4 => "NearObjects",
-                    5 => "FarObjects",
-                    _ => $"Unknown({t})"
+                    ProxyFlow.LootResponse or ProxyFlow.LootList => GetSession().TakeProxyLifecycle(ProxyFlow.Loot, ProxyFlow.LootItem),
+                    ProxyFlow.LootItem => GetSession().TakeProxyLifecycle(ProxyFlow.LootItem),
+                    ProxyFlow.ObjectUpdate => GetSession().TakeProxyLifecycle(ProxyFlow.Selection),
+                    _ => GetSession().TakeProxyLifecycle(flow)
                 };
+
+                if (lifecycle == null)
+                {
+                    lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(flow.ToString(), (int)universalOpcode);
+                    HermesProxy.Server.Metrics.MarkLegacySent(lifecycle);
+                }
+
+                HermesProxy.Server.Metrics.MarkLegacyReceived(lifecycle);
             }
-            Log.Print(LogType.Trace,
-                $"[UpdateObjectTrace][C P<S] SMSG_UPDATE_OBJECT rawBytes={raw.Length} numObjUpdates={numObjUpdates} hasTransport={hasTransport} firstUpdateType={firstUpdateType} headHex={hex}");
-        }
 
-        long startTimestamp = HermesProxy.Server.MetricsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-
-        switch (universalOpcode)
-        {
-            case Opcode.SMSG_AUTH_CHALLENGE:
-                HandleAuthChallenge(packet);
-                break;
-            case Opcode.SMSG_AUTH_RESPONSE:
-                HandleAuthResponse(packet);
-                break;
-            case Opcode.SMSG_ADDON_INFO:
-                break; // don't need to handle
-            default:
-                if (_packetHandlers.TryGetValue(universalOpcode, out var handler))
+            var previousLifecycle = _activeLifecycle.Value;
+            _activeLifecycle.Value = lifecycle;
+            try
+            {
+                switch (universalOpcode)
                 {
-                    handler(packet);
+                    case Opcode.SMSG_AUTH_CHALLENGE:
+                        HandleAuthChallenge(packet);
+                        break;
+                    case Opcode.SMSG_AUTH_RESPONSE:
+                        HandleAuthResponse(packet);
+                        break;
+                    case Opcode.SMSG_ADDON_INFO:
+                        break; // don't need to handle
+                    default:
+                        if (_packetHandlers.TryGetValue(universalOpcode, out var handler))
+                        {
+                            handler(packet);
+                        }
+                        else
+                        {
+                            RecordUnknownOpcode(universalOpcode, packet.GetOpcode(), "server_to_client");
+                            WorldClientLogMessages.NoHandlerForOpcode(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
+                            if (_isSuccessful == null && !IsIgnorableDuringHandshake(universalOpcode))
+                                _isSuccessful = false;
+                        }
+                        break;
                 }
-                else
+
+                if (HermesProxy.Server.MetricsEnabled)
                 {
-                    WorldClientLogMessages.NoHandlerForOpcode(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
-                    if (_isSuccessful == null && !IsIgnorableDuringHandshake(universalOpcode))
-                        _isSuccessful = false;
+                    HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
                 }
-                break;
-        }
 
-        if (HermesProxy.Server.MetricsEnabled)
-        {
-            HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
+                SendDelayedPacketsToServerOnOpcode(universalOpcode);
+            }
+            finally
+            {
+                _activeLifecycle.Value = previousLifecycle;
+            }
         }
+    }
 
-        SendDelayedPacketsToServerOnOpcode(universalOpcode);
+    private static void RecordUnknownOpcode(Opcode universalOpcode, uint wireOpcode, string direction)
+    {
+        var name = universalOpcode == Opcode.MSG_NULL_ACTION
+            ? $"UNKNOWN_0x{wireOpcode:X}"
+            : universalOpcode.ToString();
+        if (universalOpcode == Opcode.MSG_NULL_ACTION &&
+            wireOpcode == Opcodes.GetOpcodeValueForVersion(Opcode.SMSG_LOOT_LIST, LegacyVersion.Build))
+            name = nameof(Opcode.SMSG_LOOT_LIST);
+        HermesProxy.Server.Telemetry?.Record("unknown_opcode", direction, name, $"wire=0x{wireOpcode:X}");
+
+        if (name.Contains("MOVE", StringComparison.OrdinalIgnoreCase))
+            HermesProxy.Server.Telemetry?.Record("movement_unknown", direction, name);
+        if (name.Contains("SPELL", StringComparison.OrdinalIgnoreCase))
+            HermesProxy.Server.Telemetry?.Record("spell_unknown", direction, name);
+        if (name.Contains("CLOSE_INTERACTION", StringComparison.OrdinalIgnoreCase))
+            HermesProxy.Server.Telemetry?.Record("interaction_close_unknown", direction, name);
     }
 
     private void HandleAuthChallenge(WorldPacket packet)
