@@ -20,6 +20,7 @@ using System;
 using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace Framework.Networking;
 
@@ -45,6 +46,7 @@ public abstract class SocketBase : ISocket, IDisposable
     const int MaxQueuedWriteItems = 256;
     const int MaxQueuedWriteBytes = 4 * 1024 * 1024;
     readonly BoundedSocketWriteQueue _writeQueue;
+    int _closed;
 
     public delegate void SocketReadCallback(SocketAsyncEventArgs args);
 
@@ -160,23 +162,9 @@ public abstract class SocketBase : ISocket, IDisposable
         if (!IsOpen())
             return;
 
-        try
-        {
-            int offset = 0;
-            while (offset < data.Length)
-            {
-                int sent = _socket.Send(data, offset, data.Length - offset, SocketFlags.None);
-                if (sent <= 0)
-                    throw new SocketException((int)SocketError.ConnectionReset);
-                offset += sent;
-            }
-
-            onSent?.Invoke();
-        }
-        catch (Exception exception)
-        {
-            HandleWriteQueueFailure(exception);
-        }
+        // The writer queue remains the sole socket owner even during the handshake.
+        // Queue order preserves handshake causality without a second direct-send path.
+        _writeQueue.TryEnqueue(data, onSent);
     }
 
     private void HandleWriteQueueFailure(Exception exception)
@@ -187,12 +175,13 @@ public abstract class SocketBase : ISocket, IDisposable
 
     public void CloseSocket()
     {
-        if (_socket == null || !_socket.Connected)
+        if (Interlocked.Exchange(ref _closed, 1) != 0)
             return;
 
         try
         {
-            _socket.Shutdown(SocketShutdown.Both);
+            if (_socket.Connected)
+                _socket.Shutdown(SocketShutdown.Both);
             _socket.Close();
         }
         catch (Exception ex)
