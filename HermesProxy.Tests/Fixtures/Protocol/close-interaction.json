@@ -1,0 +1,94 @@
+[
+  {
+    "schemaVersion": 1,
+    "id": "close-interaction-positive",
+    "flow": "interaction-close",
+    "case": "positive",
+    "translation": "modern.close-interaction",
+    "direction": "modernToLegacy",
+    "wireOpcode": "0x3493",
+    "connectionType": "Instance",
+    "backendDialect": "Maelstrom",
+    "observedDialects": [ "Maelstrom", "CMaNGOS", "TrinityCore", "AzerothCore" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "01A0010408",
+    "expected": {
+      "outcome": "translated",
+      "wireOpcode": "0x0190",
+      "connectionType": "Realm",
+      "payloadHex": "",
+      "semanticFields": { "source.low": "1", "source.high": "576465150349934592" }
+    },
+    "evidence": { "kind": "documentedLayout", "source": "3.4.3 packed source GUID to 3.3.5a quest giver cancel", "sanitized": true }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "close-interaction-missing-optional",
+    "flow": "interaction-close",
+    "case": "missingOptionalField",
+    "translation": "modern.close-interaction",
+    "direction": "modernToLegacy",
+    "wireOpcode": "0x3493",
+    "connectionType": "Instance",
+    "backendDialect": "Common",
+    "observedDialects": [ "CMaNGOS", "TrinityCore", "AzerothCore", "Maelstrom" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "01A0010408",
+    "expected": {
+      "outcome": "translated",
+      "wireOpcode": "0x0190",
+      "connectionType": "Realm",
+      "payloadHex": "",
+      "semanticFields": { "optionalFields": "none" }
+    },
+    "evidence": { "kind": "documentedLayout", "source": "opcode has no optional fields", "sanitized": true }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "close-interaction-truncated",
+    "flow": "interaction-close",
+    "case": "truncated",
+    "translation": "modern.close-interaction",
+    "direction": "modernToLegacy",
+    "wireOpcode": "0x3493",
+    "connectionType": "Instance",
+    "backendDialect": "TrinityCore",
+    "observedDialects": [ "TrinityCore" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "01A00104",
+    "expected": {
+      "outcome": "rejected",
+      "wireOpcode": "0x0000",
+      "connectionType": "Instance",
+      "payloadHex": "",
+      "semanticFields": { "failure": "truncated" }
+    },
+    "evidence": { "kind": "syntheticMalformed", "source": "packed GUID body truncated", "sanitized": true }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "close-interaction-unexpected-empty-guid",
+    "flow": "interaction-close",
+    "case": "unexpectedValue",
+    "translation": "modern.close-interaction",
+    "direction": "modernToLegacy",
+    "wireOpcode": "0x3493",
+    "connectionType": "Instance",
+    "backendDialect": "CMaNGOS",
+    "observedDialects": [ "CMaNGOS" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "0000",
+    "expected": {
+      "outcome": "rejected",
+      "wireOpcode": "0x0000",
+      "connectionType": "Instance",
+      "payloadHex": "",
+      "semanticFields": { "failure": "empty-source" }
+    },
+    "evidence": { "kind": "syntheticMalformed", "source": "empty source GUID", "sanitized": true }
+  }
+]
