@@ -1,0 +1,66 @@
+{
+  "schema_version": "1.0",
+  "updated": "2026-08-21",
+  "canonical_state": "CURRENT-STATE.md",
+  "tasks": [
+    {
+      "id": "HERMES-LAT-001",
+      "title": "Prove rebuilt Hermes runtime provenance",
+      "status": "READY",
+      "depends_on": [],
+      "conflict_group": "launcher-hermes-provenance",
+      "owner_repo": "AnBPublic/ModernWoWLauncher",
+      "evidence": ["fresh launcher-started log", "runtime artifact identity", "effective config"]
+    },
+    {
+      "id": "HERMES-LAT-002",
+      "title": "Establish clean latency baseline",
+      "status": "BLOCKED",
+      "depends_on": ["HERMES-LAT-001"],
+      "conflict_group": "runtime-config-metrics",
+      "owner_repo": "AnBPublic/HermesProxy",
+      "resume_when": "Rebuilt runtime is proven and baseline can run with packet capture disabled and lifecycle metrics enabled.",
+      "evidence": ["NoDelay/TCP_NODELAY evidence", "metrics output", "packet capture disabled"]
+    },
+    {
+      "id": "HERMES-LAT-003",
+      "title": "Live-validate targeting and object updates",
+      "status": "BLOCKED",
+      "depends_on": ["HERMES-LAT-002"],
+      "conflict_group": "protocol-object-update",
+      "owner_repo": "AnBPublic/HermesProxy",
+      "evidence": ["target switches", "health changes", "aura/combat changes", "no serializer/client rejection"]
+    },
+    {
+      "id": "HERMES-LAT-004",
+      "title": "Live-validate loot compatibility and latency",
+      "status": "BLOCKED",
+      "depends_on": ["HERMES-LAT-002"],
+      "conflict_group": "protocol-loot-state",
+      "owner_repo": "AnBPublic/HermesProxy",
+      "evidence": ["basic loot", "failed loot", "rapid corpse change", "multi-item loot", "group loot", "master loot", "timestamps"]
+    },
+    {
+      "id": "HERMES-LAT-005",
+      "title": "Measure blocking legacy send leg under bursts",
+      "status": "PLANNED",
+      "depends_on": ["HERMES-LAT-002"],
+      "conflict_group": "socket-send-path",
+      "owner_repo": "AnBPublic/HermesProxy",
+      "evidence": ["queue/send timings", "burst behavior", "comparison against client-visible delay"]
+    },
+    {
+      "id": "HERMES-LAT-006",
+      "title": "Independent latency acceptance review",
+      "status": "BLOCKED",
+      "depends_on": ["HERMES-LAT-003", "HERMES-LAT-004", "HERMES-LAT-005"],
+      "conflict_group": "acceptance",
+      "owner_repo": "AnBPublic/HermesProxy",
+      "evidence": ["review of runtime provenance", "live evidence", "remaining known risks", "state promotion decision"]
+    }
+  ],
+  "parallelism": {
+    "safe_after_baseline": [["HERMES-LAT-003", "HERMES-LAT-004"]],
+    "serialize": ["Any pair sharing a conflict_group", "Deployment/provenance changes across HermesProxy and ModernWoWLauncher"]
+  }
+}

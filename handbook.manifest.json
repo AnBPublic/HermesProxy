@@ -1,0 +1,22 @@
+{
+  "standard": "agent-handbook",
+  "version": "1.0.0",
+  "derived_from": "AnBPublic/Agent-Handbook",
+  "last_reviewed": "2026-08-21",
+  "entrypoints": ["AGENTS.md", "START-HERE.md", "CURRENT-STATE.md", "PROJECT-MAP.md"],
+  "canonical": {
+    "agent_policy": "AGENTS.md",
+    "current_state": "CURRENT-STATE.md",
+    "project_map": "PROJECT-MAP.md",
+    "task_graph": "docs/agent-handbook/TASK-GRAPH.json",
+    "live_latency_validation": "docs/agent-handbook/LIVE-LATENCY-VALIDATION.md",
+    "wotlk_deep_context": "wotlk.md"
+  },
+  "status_taxonomy": "Agent-Handbook 1.0 baseline vocabulary",
+  "validation": {
+    "agents_max_lines": 200,
+    "cold_start_required": true,
+    "runtime_claims_require_runtime_evidence": true,
+    "live_claims_require_live_evidence": true
+  }
+}
