@@ -100,9 +100,25 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_BINDER_CONFIRM)]
     void HandleBinderConfirm(WorldPacket packet)
     {
+        WowGuid128 guid = packet.ReadGuid().To128(GetSession().GameState);
+        GetSession().GameState.CurrentInteractedWithNPC = guid;
+
+        // Wrath Classic 3.4.3 removed SMSG_BINDER_CONFIRM and opens the binder dialog via the
+        // generic NPC interaction result packet instead. Preserve the old packet for client builds
+        // that still map it, and use the verified 3.4.3 wire packet only when the old opcode is absent.
+        if (ModernVersion.GetCurrentOpcode(Opcode.SMSG_BINDER_CONFIRM) == 0)
+        {
+            BinderInteractionOpenResult343 interaction = new BinderInteractionOpenResult343
+            {
+                Guid = guid,
+                Success = true,
+            };
+            SendPacketToClient(interaction);
+            return;
+        }
+
         BinderConfirm confirm = new BinderConfirm();
-        confirm.Guid = packet.ReadGuid().To128(GetSession().GameState);
-        GetSession().GameState.CurrentInteractedWithNPC = confirm.Guid;
+        confirm.Guid = guid;
         SendPacketToClient(confirm);
     }
 

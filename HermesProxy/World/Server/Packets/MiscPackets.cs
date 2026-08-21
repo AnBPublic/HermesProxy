@@ -36,6 +36,18 @@ public class EmptyClientPacket : ClientPacket
     }
 }
 
+public class CloseInteraction : ClientPacket
+{
+    public CloseInteraction(WorldPacket packet) : base(packet) { }
+
+    public override void Read()
+    {
+        SourceGuid = _worldPacket.ReadPackedGuid128();
+    }
+
+    public WowGuid128 SourceGuid;
+}
+
 public class BindPointUpdate : ServerPacket, ISpanWritable
 {
     public BindPointUpdate() : base(Opcode.SMSG_BIND_POINT_UPDATE, ConnectionType.Instance) { }
