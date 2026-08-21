@@ -89,7 +89,7 @@ In the rolling file (`Logs/hermes-YYYYMMDD.log`) the same layout is used but wit
 | `Log.Console.MinimumLevel`    | `Information` | Additional floor applied ONLY to the console. File sink captures everything the categories allow.                    |
 | `Log.ToFile`                  | `true`        | Write a daily rolling log file to `Log.Directory/hermes-YYYY-MM-DD.log`. Last 30 days are retained automatically.    |
 | `Log.Directory`               | `Logs`        | Directory (relative to the working directory) where rolling log files are placed.                                    |
-| `PacketsLog`                  | `true`        | Dump each session's raw packets to a `.pkt` file in `PacketsLog/` for replay / inspection (unrelated to text logs).  |
+| `PacketsLog`                  | `false`       | Dump each session's raw packets to a `.pkt` file in `PacketsLog/` for replay / inspection (unrelated to text logs). Enable only for a controlled reproduction. |
 | `DebugOutput` *(legacy)*      | `false`       | Back-compat shortcut — lowers `Log.MinimumLevel` and `Log.Console.MinimumLevel` to `Debug`.                          |
 | `SpanStatsLog` *(legacy)*     | `false`       | Back-compat shortcut — lowers `Log.Packet.MinimumLevel` to `Verbose`.                                                |
 

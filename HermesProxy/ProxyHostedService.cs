@@ -9,6 +9,7 @@ using BNetServer.Networking;
 using Framework.Logging;
 using Framework.Networking;
 using HermesProxy.Configuration.Options;
+using HermesProxy.Telemetry;
 using HermesProxy.World;
 using HermesProxy.World.Server;
 using Microsoft.Extensions.Hosting;
@@ -24,6 +25,7 @@ internal sealed class ProxyHostedService : BackgroundService
     private readonly IOptions<ProxyNetworkOptions> _networkOptions;
     private readonly IOptions<LoggingOptions> _loggingOptions;
     private readonly IOptions<DiagnosticsOptions> _diagnosticsOptions;
+    private readonly IOptions<TelemetryOptions> _telemetryOptions;
     private readonly LoginServiceManager _loginServiceManager;
     private readonly SocketManager<BnetTcpSession> _bnetSocketManager;
     private readonly SocketManager<BnetRestApiSession> _restSocketManager;
@@ -37,6 +39,7 @@ internal sealed class ProxyHostedService : BackgroundService
         IOptions<ProxyNetworkOptions> networkOptions,
         IOptions<LoggingOptions> loggingOptions,
         IOptions<DiagnosticsOptions> diagnosticsOptions,
+        IOptions<TelemetryOptions> telemetryOptions,
         LoginServiceManager loginServiceManager,
         SocketManager<BnetTcpSession> bnetSocketManager,
         SocketManager<BnetRestApiSession> restSocketManager,
@@ -49,6 +52,7 @@ internal sealed class ProxyHostedService : BackgroundService
         _networkOptions = networkOptions;
         _loggingOptions = loggingOptions;
         _diagnosticsOptions = diagnosticsOptions;
+        _telemetryOptions = telemetryOptions;
         _loginServiceManager = loginServiceManager;
         _bnetSocketManager = bnetSocketManager;
         _restSocketManager = restSocketManager;
@@ -66,7 +70,13 @@ internal sealed class ProxyHostedService : BackgroundService
         }
 #endif
 
-        Server.MetricsEnabled = _diagnosticsOptions.Value.EnableMetrics;
+        Server.MetricsEnabled = _diagnosticsOptions.Value.EnableMetrics || _telemetryOptions.Value.Enabled;
+        Server.Telemetry = new ProxyTelemetry(
+            _telemetryOptions.Value,
+            Server.Metrics,
+            _clientOptions.Value.ClientBuild.ToString(),
+            _legacyServerOptions.Value.ResolvedBuild.ToString());
+        Server.Telemetry.Record("session_started", detail: $"metrics={Server.MetricsEnabled};packetsLog={_diagnosticsOptions.Value.PacketsLog}");
 
         Log.Print(LogType.Server, "Starting Hermes Proxy...");
         Server.LogVersion();
@@ -122,12 +132,21 @@ internal sealed class ProxyHostedService : BackgroundService
             const int metricsLogIntervalSeconds = 60;
             const int loopIntervalSeconds = 10;
             const int displayMetricCount = 20;
+            var telemetryFlushIntervalSeconds = Math.Max(1, _telemetryOptions.Value.FlushIntervalSeconds);
+            var telemetryFlushCounter = 0;
 
             while (!stoppingToken.IsCancellationRequested &&
                    (_bnetSocketManager.IsListening || _restSocketManager.IsListening
                     || _realmSocketManager.IsListening || _worldSocketManager.IsListening))
             {
                 await Task.Delay(TimeSpan.FromSeconds(loopIntervalSeconds), stoppingToken);
+
+                telemetryFlushCounter += loopIntervalSeconds;
+                if (telemetryFlushCounter >= telemetryFlushIntervalSeconds)
+                {
+                    telemetryFlushCounter = 0;
+                    Server.Telemetry?.Flush();
+                }
 
                 if (Server.MetricsEnabled)
                 {
@@ -156,6 +175,8 @@ internal sealed class ProxyHostedService : BackgroundService
             TryStop(_realmSocketManager);
             TryStop(_restSocketManager);
             TryStop(_bnetSocketManager);
+            Server.Telemetry?.Dispose();
+            Server.Telemetry = null;
         }
     }
 

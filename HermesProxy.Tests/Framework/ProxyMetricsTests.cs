@@ -1,4 +1,5 @@
 using Framework.Metrics;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Xunit;
 
@@ -157,5 +158,31 @@ public class ProxyMetricsTests
         Assert.Equal(1.0, stats1?.Average);
         Assert.Equal(2.0, stats2?.Average);
         Assert.Equal(3.0, stats3?.Average);
+    }
+
+    [Fact]
+    public void Lifecycle_TracksNetworkStagesAndEndToEndLatency()
+    {
+        var metrics = new ProxyMetrics();
+        long start = Stopwatch.GetTimestamp();
+
+        var lifecycle = metrics.BeginLifecycle("loot", 0x100, start);
+        metrics.MarkLegacySent(lifecycle, start + ToStopwatchTicks(10));
+        metrics.MarkLegacyReceived(lifecycle, start + ToStopwatchTicks(35));
+        metrics.MarkModernSent(lifecycle, start + ToStopwatchTicks(45));
+
+        var stats = metrics.GetLifecycleStats("loot");
+
+        Assert.NotNull(stats);
+        Assert.Equal(1, stats.Value.Count);
+        Assert.Equal(10, stats.Value.ModernToLegacy.Average, 1);
+        Assert.Equal(25, stats.Value.LegacyWait.Average, 1);
+        Assert.Equal(10, stats.Value.LegacyToModern.Average, 1);
+        Assert.Equal(45, stats.Value.EndToEnd.Average, 1);
+    }
+
+    private static long ToStopwatchTicks(int milliseconds)
+    {
+        return milliseconds * Stopwatch.Frequency / 1000;
     }
 }

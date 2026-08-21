@@ -181,7 +181,7 @@ Full reference (line format, severity/category letters, settings table, CLI exam
 
 | Key                  | Default | Description                                                                  |
 |----------------------|---------|------------------------------------------------------------------------------|
-| `PacketsLog`         | `true`  | Dump each session's raw packets to `PacketsLog/*.pkt` for replay/inspection. |
+| `PacketsLog`         | `false` | Dump each session's raw packets to `PacketsLog/*.pkt` for replay/inspection; enable only for a controlled reproduction. |
 | `EnableMetrics`      | `false` | Same as `--metrics` flag; per-opcode latency summary every 60 s.             |
 | `EnableVersionCheck` | `true`  | Check for newer HermesProxy versions on startup.                             |
 
@@ -218,7 +218,7 @@ Full reference (line format, severity/category letters, settings table, CLI exam
     "Directory": "Logs"
   },
   "DiagnosticsOptions": {
-    "PacketsLog": true,
+    "PacketsLog": false,
     "EnableMetrics": false,
     "EnableVersionCheck": true
   }

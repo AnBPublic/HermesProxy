@@ -6,6 +6,7 @@ using HermesProxy.Auth;
 using HermesProxy.World;
 using HermesProxy.World.Client;
 using HermesProxy.World.Server;
+using HermesProxy.Telemetry;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -36,12 +37,20 @@ partial class Server
     public static readonly ProxyMetrics Metrics = new();
 
     /// <summary>
+    /// Metadata-only session telemetry. It is owned and finalized by the hosted service.
+    /// </summary>
+    public static ProxyTelemetry? Telemetry { get; internal set; }
+
+    /// <summary>
     /// Whether metrics collection is enabled. Set once by ProxyHostedService from DiagnosticsOptions.
     /// </summary>
     public static bool MetricsEnabled { get; internal set; }
 
     internal static void LogVersion()
-        => ServerLogMessages.Version(_melServer, _sourceFile, _netDirNone, GetVersionInformation());
+    {
+        ServerLogMessages.Version(_melServer, _sourceFile, _netDirNone, GetVersionInformation());
+        Log.Print(LogType.Server, $"HERMES_SOURCE_COMMIT; commit={GitVersionInformation.ShortSha}; dirty={GitVersionInformation.UncommittedChanges}");
+    }
 
     internal static void LogClientAndServerBuild(ClientVersionBuild clientBuild, ClientVersionBuild serverBuild)
     {

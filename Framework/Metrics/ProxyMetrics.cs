@@ -21,6 +21,8 @@ public sealed class ProxyMetrics
     // Per-opcode latency samples (circular buffer)
     private readonly ConcurrentDictionary<int, LatencySamples> _clientToServerLatency = new();
     private readonly ConcurrentDictionary<int, LatencySamples> _serverToClientLatency = new();
+    private readonly ConcurrentDictionary<string, LifecycleSamples> _lifecycleLatency = new(StringComparer.OrdinalIgnoreCase);
+    private long _nextLifecycleId;
 
     private readonly DateTime _startTime = DateTime.UtcNow;
 
@@ -42,6 +44,66 @@ public sealed class ProxyMetrics
     public void RecordServerToClientLatency(Enum opcode, long elapsedTicks)
     {
         RecordServerToClientLatency(Convert.ToInt32(opcode), elapsedTicks * TicksToMs);
+    }
+
+    /// <summary>
+    /// Starts an end-to-end lifecycle sample. The returned token is safe to pass
+    /// across the modern and legacy socket callbacks for one session.
+    /// </summary>
+    public ProxyLifecycle BeginLifecycle(string flow, int requestOpcode)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flow);
+        return BeginLifecycle(flow, requestOpcode, Stopwatch.GetTimestamp());
+    }
+
+    internal ProxyLifecycle BeginLifecycle(string flow, int requestOpcode, long startTimestamp)
+    {
+        return new ProxyLifecycle(
+            Interlocked.Increment(ref _nextLifecycleId),
+            flow,
+            requestOpcode,
+            startTimestamp);
+    }
+
+    public void MarkLegacySent(ProxyLifecycle lifecycle)
+    {
+        MarkLegacySent(lifecycle, Stopwatch.GetTimestamp());
+    }
+
+    internal void MarkLegacySent(ProxyLifecycle lifecycle, long timestamp)
+    {
+        lifecycle.MarkLegacySent(timestamp);
+    }
+
+    public void MarkLegacyReceived(ProxyLifecycle lifecycle)
+    {
+        MarkLegacyReceived(lifecycle, Stopwatch.GetTimestamp());
+    }
+
+    internal void MarkLegacyReceived(ProxyLifecycle lifecycle, long timestamp)
+    {
+        lifecycle.MarkLegacyReceived(timestamp);
+    }
+
+    public void MarkModernSent(ProxyLifecycle lifecycle)
+    {
+        MarkModernSent(lifecycle, Stopwatch.GetTimestamp());
+    }
+
+    internal void MarkModernSent(ProxyLifecycle lifecycle, long timestamp)
+    {
+        if (lifecycle.MarkModernSent(timestamp, out var sample))
+        {
+            var samples = _lifecycleLatency.GetOrAdd(
+                lifecycle.Flow,
+                _ => new LifecycleSamples(MaxSamplesPerOpcode));
+            samples.Add(sample);
+        }
+    }
+
+    public ProxyLifecycleStats? GetLifecycleStats(string flow)
+    {
+        return _lifecycleLatency.TryGetValue(flow, out var samples) ? samples.GetStats() : null;
     }
 
     /// <summary>
@@ -114,6 +176,7 @@ public sealed class ProxyMetrics
     {
         _clientToServerLatency.Clear();
         _serverToClientLatency.Clear();
+        _lifecycleLatency.Clear();
     }
 
     /// <summary>
@@ -166,7 +229,141 @@ public sealed class ProxyMetrics
             }
         }
 
+        var lifecycleStats = _lifecycleLatency
+            .Select(x => (x.Key, Stats: x.Value.GetStats()))
+            .OrderByDescending(x => x.Stats.EndToEnd.P99)
+            .Take(topN)
+            .ToList();
+
+        if (lifecycleStats.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("End-to-end lifecycle (top by p99):");
+            sb.AppendLine($"  {"Flow",-24} {"Count",8} {"C->S",10} {"S wait",10} {"S->C",10} {"Total",10}");
+            foreach (var (flow, stats) in lifecycleStats)
+            {
+                sb.AppendLine($"  {flow,-24} {stats.Count,8} {stats.ModernToLegacy.Average,8:F3}ms {stats.LegacyWait.Average,8:F3}ms {stats.LegacyToModern.Average,8:F3}ms {stats.EndToEnd.Average,8:F3}ms");
+            }
+        }
+
         return sb.ToString();
+    }
+}
+
+public sealed class ProxyLifecycle
+{
+    private readonly object _sync = new();
+    private long? _legacySentTimestamp;
+    private long? _legacyReceivedTimestamp;
+    private long? _modernSentTimestamp;
+    private bool _completed;
+
+    internal ProxyLifecycle(long id, string flow, int requestOpcode, long modernReceivedTimestamp)
+    {
+        Id = id;
+        Flow = flow;
+        RequestOpcode = requestOpcode;
+        ModernReceivedTimestamp = modernReceivedTimestamp;
+    }
+
+    public long Id { get; }
+    public string Flow { get; }
+    public int RequestOpcode { get; }
+    internal long ModernReceivedTimestamp { get; }
+
+    internal void MarkLegacySent(long timestamp)
+    {
+        lock (_sync)
+        {
+            _legacySentTimestamp ??= timestamp;
+        }
+    }
+
+    internal void MarkLegacyReceived(long timestamp)
+    {
+        lock (_sync)
+        {
+            _legacyReceivedTimestamp ??= timestamp;
+        }
+    }
+
+    internal bool MarkModernSent(long timestamp, out ProxyLifecycleSample sample)
+    {
+        lock (_sync)
+        {
+            _modernSentTimestamp ??= timestamp;
+            if (_completed ||
+                _legacySentTimestamp is not long legacySent ||
+                _legacyReceivedTimestamp is not long legacyReceived ||
+                _modernSentTimestamp is not long modernSent)
+            {
+                sample = default;
+                return false;
+            }
+
+            _completed = true;
+            sample = new ProxyLifecycleSample(
+                ToMilliseconds(legacySent - ModernReceivedTimestamp),
+                ToMilliseconds(legacyReceived - legacySent),
+                ToMilliseconds(modernSent - legacyReceived),
+                ToMilliseconds(modernSent - ModernReceivedTimestamp));
+            return true;
+        }
+    }
+
+    private static double ToMilliseconds(long timestampDelta)
+    {
+        return timestampDelta * (1000.0 / Stopwatch.Frequency);
+    }
+}
+
+internal readonly record struct ProxyLifecycleSample(
+    double ModernToLegacy,
+    double LegacyWait,
+    double LegacyToModern,
+    double EndToEnd);
+
+public struct ProxyLifecycleStats
+{
+    public int Count => EndToEnd.Count;
+    public LatencyStats ModernToLegacy;
+    public LatencyStats LegacyWait;
+    public LatencyStats LegacyToModern;
+    public LatencyStats EndToEnd;
+}
+
+internal sealed class LifecycleSamples
+{
+    private readonly LatencySamples _modernToLegacy;
+    private readonly LatencySamples _legacyWait;
+    private readonly LatencySamples _legacyToModern;
+    private readonly LatencySamples _endToEnd;
+
+    public LifecycleSamples(int maxSamples)
+    {
+        _modernToLegacy = new LatencySamples(maxSamples);
+        _legacyWait = new LatencySamples(maxSamples);
+        _legacyToModern = new LatencySamples(maxSamples);
+        _endToEnd = new LatencySamples(maxSamples);
+    }
+
+    public void Add(ProxyLifecycleSample sample)
+    {
+        _modernToLegacy.Add(sample.ModernToLegacy);
+        _legacyWait.Add(sample.LegacyWait);
+        _legacyToModern.Add(sample.LegacyToModern);
+        _endToEnd.Add(sample.EndToEnd);
+    }
+
+    public ProxyLifecycleStats GetStats()
+    {
+        return new ProxyLifecycleStats
+        {
+            ModernToLegacy = _modernToLegacy.GetStats(),
+            LegacyWait = _legacyWait.GetStats(),
+            LegacyToModern = _legacyToModern.GetStats(),
+            EndToEnd = _endToEnd.GetStats()
+        };
     }
 }
 

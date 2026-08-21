@@ -119,6 +119,9 @@ public class Program
         builder.Services.AddOptions<DiagnosticsOptions>()
             .Bind(builder.Configuration.GetSection(nameof(DiagnosticsOptions)))
             .ValidateOnStart();
+        builder.Services.AddOptions<TelemetryOptions>()
+            .Bind(builder.Configuration.GetSection(nameof(TelemetryOptions)))
+            .ValidateOnStart();
 
         builder.Services.AddSingleton<IPostConfigureOptions<ClientOptions>, ClientSeedParser>();
         builder.Services.AddSingleton<IPostConfigureOptions<LegacyServerOptions>, LegacyServerBuildResolver>();
@@ -249,6 +252,7 @@ public class Program
     {
         // Final drain on normal shutdown — covers clean exits that still left
         // async-sink entries in flight.
+        try { Server.Telemetry?.Dispose(); Server.Telemetry = null; } catch { /* best effort */ }
         try { Log.Shutdown(); } catch { /* best effort */ }
     }
 
