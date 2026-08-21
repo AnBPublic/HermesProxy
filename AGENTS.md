@@ -1,97 +1,124 @@
-# HermesProxy Repository Guidance
+# HermesProxy Agent Router
 
-**Purpose:** Translation layer between modern WoW Classic clients and legacy private server emulators. This repository is the AnBPublic working copy of upstream Xian55/HermesProxy, with active WotLK 3.4.3 support development (see `wotlk.md`).
+This file is the compact canonical router for agents working in this repository. Do not use chat history as project state.
 
-**Canonical Target:** Modern clients (1.14.0-1.14.2 Classic Era, 2.5.2-2.5.3 TBC Classic) connecting to legacy servers (1.12.1-1.12.3 Vanilla, 2.4.3 TBC). WotLK Classic 3.4.3.54261 → 3.3.5a server support is in active development (feature/wotlk-classic-v3.4.3 branch, wotlk.md roadmap).
+## Read first
 
-## Architectural Boundaries
+1. `START-HERE.md`
+2. `CURRENT-STATE.md`
+3. `PROJECT-MAP.md`
+4. `wotlk.md` when work touches 3.4.3.54261 -> 3.3.5a translation
+5. `docs/agent-handbook/TASK-GRAPH.json` for current dependencies/conflicts
+6. `docs/agent-handbook/LIVE-LATENCY-VALIDATION.md` for the latency proof gate
 
-- **BNetServer:** Modern client Battle.net handshake endpoint (BNetPort, default 1119)
-- **AuthClient:** Legacy authentication client (connects to realmd on Address:Port)
-- **WorldServer:** Modern game world endpoint (RealmPort, InstancePort)
-- **WorldClient:** Legacy world client (connects to mangosd/worldserver)
-- **Do not conflate** the modern server components with the legacy server components
+The handbook derives from `AnBPublic/Agent-Handbook` Standard 1.0. Root `AGENTS.md` is canonical shared agent policy. Vendor-specific steering files are adapters only and must not become competing sources of truth.
 
-## Cross-Repository Contracts
+## Repository purpose
 
-- **ModernWoWLauncher:** Consumes HermesProxy as managed bridge; launcher sets portal to BNetPort
-- **ProRotationPilot-3.4.3:** Expects to run through HermesProxy against 3.3.5a-ruleset servers
-- Protocol compatibility changes **must not** break existing 1.14.x/2.5.x client support
+HermesProxy is the protocol translation layer between modern WoW clients and legacy server emulators. This working copy also develops Wrath Classic `3.4.3.54261` -> legacy `3.3.5a` compatibility used by ModernWoWLauncher.
 
-## Compatibility Constraints
+## Source-of-truth order
 
-**Supported Version Mappings (proven):**
-- 1.14.x modern client → 1.12.x legacy server
-- 2.5.x modern client → 2.4.3 legacy server
+When sources disagree, resolve in this order:
 
-**WotLK 3.4.3 Support (in development):**
-- 3.4.3.54261 modern client → 3.3.5a legacy server
-- ObjectUpdate format changed to descriptor-based system (see wotlk.md § "Why this is a large effort")
-- Do **not** claim this mapping works without evidence from live testing
-- Phase 0-5 roadmap in `wotlk.md` must be followed
+1. actual source code and current Git state;
+2. executable tests and deterministic build output;
+3. fresh packet/runtime evidence from the exact target client/server/runtime;
+4. accepted ADRs/normative protocol constraints;
+5. `CURRENT-STATE.md`;
+6. `wotlk.md`, handovers, research and older prose;
+7. chat history.
 
-**MUST NOT assume a client/server combination works** without:
-1. Verification in `wotlk.md` phased roadmap completion
-2. Live end-to-end testing evidence
-3. Corresponding feature branch merged to master
+Never let stale prose override current code/runtime evidence. Never let static tests create a live-validation claim.
 
-## Configuration Precedence
+## Status vocabulary
 
-Layered overrides applied in order (later overrides earlier):
+Use only explicit states where practical: `UNKNOWN`, `DISCOVERED`, `PLANNED`, `READY`, `IN_PROGRESS`, `BLOCKED`, `IMPLEMENTED_STATIC`, `RUNTIME_VALIDATED`, `LIVE_VALIDATED`, `ACCEPTED`, `COMPLETE`, `FROZEN`, `PROBE_REQUIRED`, `SUPERSEDED`, `DEPRECATED`, `NOT_PLANNED`.
 
-1. `appsettings.json` — base configuration (required)
-2. `appsettings.{Environment}.json` — environment-specific overlay (optional)
-3. `HERMES_*` environment variables — `HERMES_Section__Key=Value` format
-4. CLI args — `--Section:Key=Value` (native) or `--set Key=Value` (legacy)
+For WotLK gameplay compatibility, `IMPLEMENTED_STATIC` is not equivalent to `LIVE_VALIDATED`.
 
-**TLS Certificate:** Default TrinityCore-compatible cert (`CN=*.*`). Custom cert via `CertificatePfxPath`/`CertificatePfxPassword` in `ProxyNetworkOptions`. Do not change default unless targeting system trust store validation.
+## Non-negotiable boundaries
 
-## Validation Commands
+- Preserve proven 1.14.x -> 1.12.x and 2.5.x -> 2.4.3 behavior unless a separately justified change explicitly covers those mappings.
+- Keep modern-facing server components (`BNetServer`, `WorldServer`) conceptually separate from legacy-facing clients (`AuthClient`, `WorldClient`).
+- Do not claim `3.4.3.54261` -> `3.3.5a` works for a behavior unless the exact behavior was observed live.
+- Do not weaken crash diagnostics or compatibility checks to make tests pass.
+- Do not alter pooled-buffer/performance paths casually; benchmark or collect runtime evidence when changing latency-sensitive code.
+- Protocol/opcode/object-update changes require focused tests and independent review.
+- Implementation, release and deployment are separate authorities.
+
+## Current latency program
+
+As of 2026-08-21 the correct project label is:
+
+> `IMPLEMENTED_STATIC` / source-level latency remediation in progress; low-latency gameplay is not yet confirmed live.
+
+The mandatory next proof gate is a fresh launcher-started session using the rebuilt Hermes runtime. Required evidence is defined in `CURRENT-STATE.md` and `docs/agent-handbook/LIVE-LATENCY-VALIDATION.md`.
+
+Do not promote the latency work to `RUNTIME_VALIDATED`, `LIVE_VALIDATED`, `ACCEPTED`, or `COMPLETE` merely because builds/tests pass.
+
+## Cross-repository ownership
+
+- **HermesProxy owns:** protocol translation, packet handling, object-update serialization, socket behavior, proxy metrics/logging behavior.
+- **ModernWoWLauncher owns:** runtime selection, provenance/readiness checks, deployment/copy/start orchestration, user-facing launch flow.
+- **ProRotationPilot-3.4.3 consumes the resulting gameplay environment** and must not be used as proof that Hermes translation is correct.
+
+When a defect crosses the Hermes/launcher seam, state which repo owns the fix and what evidence the other repo must provide.
+
+## Validation
+
+For source changes, normally run and inspect:
 
 ```bash
-# Build and test
 dotnet build HermesProxy.sln -c Release
 dotnet test HermesProxy.sln -c Release
-
-# Run with diagnostics
-dotnet run --config appsettings.json --LoggingOptions:PacketLevel=Debug --metrics
-
-# Verify crash diagnostics
-# Dumps written to bin/<Release|Debug>/Logs/crash-<pid>.dmp
 ```
 
-**Required:** Run `dotnet test` and verify same pass count before committing.
+For latency/compatibility work, source checks are necessary but insufficient. Collect the exact runtime evidence required by the live-validation playbook.
 
-## Git/Change-Safety Rules
+## Task discipline
 
-- **master branch** tracks upstream with AnBPublic-specific additions
-- Do **not** force-push to master
-- Rebase feature work on current master before PR
+Before editing:
 
-**Never infer current server/client compatibility status from AGENTS.md. Read the canonical WotLK compatibility/status documentation (`wotlk.md`) and latest validation evidence.**
+- inspect current branch/HEAD/status;
+- identify the task capsule, dependencies, write set and conflict group;
+- read only the smallest authoritative context set first;
+- record unknowns instead of guessing.
 
-## Things an Agent MUST NOT Do
+During work:
 
-- Claim a client/server version combination works without live verification
-- Modify upstream core without maintaining 1.14.x/2.5.x compatibility
-- Change BnetTcpSession pooled-buffer/performance paths without benchmarking
-- Remove or weaken existing crash diagnostics (`DOTNET_DbgEnableMiniDump`)
-- Assume WotLK 3.4.3 support is complete (it is not — see wotlk.md)
-- Merge feature/wotlk-classic-v3.4.3 to master before Phase 5 completion
+- keep changes bounded to the owning subsystem;
+- add/extend characterization tests for risky protocol behavior;
+- avoid parallel writes to shared protocol/schema/socket seams unless explicitly serialized.
 
-## Documentation That Must Be Updated
+On completion:
 
-- **wotlk.md:** After any WotLK 3.4.3 development milestone
-- **docs/known-issues.md:** When new client/server quirks are discovered
-- **README.md:** Only if upstream README changes are pulled in
+- run required checks and report exact results;
+- get independent review for protocol, socket, object-update, release/deploy or cross-repo changes;
+- update `CURRENT-STATE.md` and task graph when project truth changes;
+- harvest durable findings into docs/tests/ADRs, not chat transcripts;
+- leave exact evidence needed for resumption if blocked.
 
-## Live vs Static Validation
+## Stuck protocol
 
-- **Static:** `dotnet build`, `dotnet test`, configuration parsing
-- **Live:** Actual client connection, packet capture analysis, end-to-end gameplay
-- Always distinguish: "builds and tests pass" vs "verified in-game"
+Classify blockers as one of: missing runtime evidence, protocol unknown, architecture decision, test gap, tooling/environment, deployment/provenance, cross-repo dependency, or external/server behavior.
 
-## Related Repositories
+If blocked, record:
 
-- **ModernWoWLauncher:** Primary consumer (launcher integration)
-- **ProRotationPilot-3.4.3:** Secondary consumer (rotation addon for WotLK)
+- what is known;
+- what is unknown;
+- failed approaches/evidence;
+- the smallest probe needed next;
+- exact files/logs/runtime needed to resume.
+
+Do not improvise around a missing live packet capture or deploy mismatch by declaring success.
+
+## Documentation ownership
+
+- `CURRENT-STATE.md` — canonical current verified state and next gate.
+- `PROJECT-MAP.md` — architecture/source/test/deploy ownership map.
+- `wotlk.md` — WotLK compatibility roadmap/deeper protocol notes, not the sole current-state authority.
+- `docs/agent-handbook/TASK-GRAPH.json` — machine-readable active work/dependencies/conflicts.
+- `docs/agent-handbook/LIVE-LATENCY-VALIDATION.md` — repeatable live proof procedure.
+
+If a meaningful change makes any of these stale, updating the relevant handbook knowledge is part of completion.
