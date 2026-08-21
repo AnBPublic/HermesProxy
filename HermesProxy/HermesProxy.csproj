@@ -91,7 +91,9 @@
          Analyzer-only reference: the generator assembly is not shipped with HermesProxy. -->
     <ProjectReference Include="..\HermesProxy.SourceGen\HermesProxy.SourceGen.csproj"
                       OutputItemType="Analyzer"
-                      ReferenceOutputAssembly="false" />
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="All"
+                      UndefineProperties="RuntimeIdentifier;SelfContained;PublishTrimmed;PublishReadyToRun;PublishSingleFile;PublishAot" />
   </ItemGroup>
 
   <ItemGroup>
