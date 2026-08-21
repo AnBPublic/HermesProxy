@@ -44,6 +44,16 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_DOUBLE_JUMP)]
     void HandlePlayerMove(ClientPlayerMovement movement)
     {
+        uint clientMoveTime = movement.MoveInfo.MoveTime;
+        if (!GetSession().GameState.Movement.TryAccept(movement.MoveInfo, Environment.TickCount64, out var rejection))
+        {
+            Log.Print(LogType.Error, $"Rejected {movement.GetUniversalOpcode()} movement raw=0x{movement.GetOpcode():X}: {rejection}");
+            return;
+        }
+
+        MovementTrace.Record("modern-to-legacy", movement.GetUniversalOpcode(), movement.GetOpcode(),
+            $"clientTime={clientMoveTime} legacyTime={movement.MoveInfo.MoveTime} transport=0x{movement.MoveInfo.TransportGuid.Low:X}");
+
         string opcodeName = movement.GetUniversalOpcode().ToString();
         opcodeName = opcodeName.Replace("CMSG", "MSG");
         uint opcode = Opcodes.GetOpcodeValueForVersion(opcodeName, LegacyVersion.Build);
@@ -137,6 +147,8 @@ public partial class WorldSocket
     void HandleMoveForceSpeedChangeAck(MovementSpeedAck speed)
     {
         var opcode = speed.GetUniversalOpcode();
+        MovementTrace.Record("forced-movement-ack", opcode, speed.GetOpcode(),
+            $"counter={speed.Ack.MoveCounter} speed={speed.Speed:F3}");
         if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180)
             && opcode is Opcode.CMSG_MOVE_FORCE_FLIGHT_SPEED_CHANGE_ACK
                       or Opcode.CMSG_MOVE_FORCE_FLIGHT_BACK_SPEED_CHANGE_ACK)
@@ -175,6 +187,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_WATER_WALK_ACK)]
     void HandleMoveForceAck1(MovementAckMessage movementAck)
     {
+        MovementTrace.Record("forced-movement-ack", movementAck.GetUniversalOpcode(), movementAck.GetOpcode(),
+            $"counter={movementAck.Ack.MoveCounter}");
         WorldPacket packet = new WorldPacket(movementAck.GetUniversalOpcode());
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
             packet.WritePackedGuid(movementAck.MoverGUID.To64());
@@ -193,6 +207,8 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_GRAVITY_ENABLE_ACK)]
     void HandleMoveForceAck2(MovementAckMessage movementAck)
     {
+        MovementTrace.Record("forced-movement-ack", movementAck.GetUniversalOpcode(), movementAck.GetOpcode(),
+            $"counter={movementAck.Ack.MoveCounter}");
         WorldPacket packet = new WorldPacket(movementAck.GetUniversalOpcode());
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V3_2_0_10192))
             packet.WritePackedGuid(movementAck.MoverGUID.To64());
@@ -206,9 +222,10 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_MOVE_SET_COLLISION_HEIGHT_ACK)]
     void HandleMoveSetCollisionHeightAck(MoveSetCollisionHeightAck collisionHeightAck)
     {
-        // This opcode doesn't exist in legacy servers (Vanilla/TBC/WotLK).
-        // The modern client sends it in response to SMSG_MOVE_SET_COLLISION_HEIGHT,
-        // but legacy servers don't expect or need it. Simply discard the packet.
+        // Classified harmless modern-only service acknowledgement: 3.3.5a has no
+        // corresponding opcode. Capture it, but do not invent a legacy translation.
+        MovementTrace.Record("collision-ack", collisionHeightAck.GetUniversalOpcode(), collisionHeightAck.GetOpcode(),
+            $"counter={collisionHeightAck.Ack.MoveCounter} height={collisionHeightAck.Height:F3} reason={collisionHeightAck.Reason}");
     }
 
     [PacketHandler(Opcode.CMSG_SET_ACTIVE_MOVER)]

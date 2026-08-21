@@ -41,6 +41,14 @@ partial class Server
     /// </summary>
     public static ProxyTelemetry? Telemetry { get; internal set; }
 
+    private static int _isShuttingDown;
+    public static bool IsShuttingDown => Volatile.Read(ref _isShuttingDown) != 0;
+
+    internal static void SetShuttingDown(bool value)
+    {
+        Volatile.Write(ref _isShuttingDown, value ? 1 : 0);
+    }
+
     /// <summary>
     /// Whether metrics collection is enabled. Set once by ProxyHostedService from DiagnosticsOptions.
     /// </summary>

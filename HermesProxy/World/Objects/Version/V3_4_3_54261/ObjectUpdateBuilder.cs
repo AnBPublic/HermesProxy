@@ -13,6 +13,7 @@ using Framework.Util;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Server.Packets;
 using System;
+using System.Collections.Generic;
 
 namespace HermesProxy.World.Objects.Version.V3_4_3_54261;
 
@@ -27,6 +28,7 @@ public partial class ObjectUpdateBuilder
     private readonly ObjectTypeBCC _realObjectType;
     private readonly ObjectTypeMask _objectTypeMask;
     private CreateObjectBits _createBits;
+    private uint _lastValuesChangedMask;
 
     public ObjectUpdateBuilder(ObjectUpdate updateData, GameSessionData gameState)
     {
@@ -71,6 +73,24 @@ public partial class ObjectUpdateBuilder
         _realObjectType == ObjectTypeBCC.ActivePlayer ||
         _realObjectType == ObjectTypeBCC.Item ||
         _realObjectType == ObjectTypeBCC.Container;
+
+    private bool IsPartyMember
+    {
+        get
+        {
+            if (_realObjectType != ObjectTypeBCC.Player || _updateData.Guid == _gameState.CurrentPlayerGuid)
+                return false;
+            var group = _gameState.GetCurrentGroup();
+            if (group == null)
+                return false;
+            foreach (var member in group.PlayerList)
+                if (member.GUID == _updateData.Guid)
+                    return true;
+            return false;
+        }
+    }
+
+    internal byte UpdateFieldVisibilityFlags => (byte)((IsOwner ? 0x03 : 0) | (IsPartyMember ? 0x02 : 0));
 
     private bool IsGameObjectOwner
     {
@@ -1453,7 +1473,7 @@ public partial class ObjectUpdateBuilder
         bool trace = _objectType == ObjectTypeBCC.ActivePlayer;
 
         // Owner=0x01, PartyMember=0x02 (needed for QuestLog visibility).
-        byte updateFieldFlags = (byte)(IsOwner ? 0x03 : 0);
+        byte updateFieldFlags = UpdateFieldVisibilityFlags;
         data.WriteUInt8(updateFieldFlags);
 
         int p0 = data.GetData().Length;
@@ -1545,6 +1565,7 @@ public partial class ObjectUpdateBuilder
         if (hasPlayerChanges) changedMask |= 0x40;
         if (hasActivePlayerChanges) changedMask |= 0x80;
         if (hasGameObjectChanges) changedMask |= 0x100;
+        _lastValuesChangedMask = changedMask;
 
         // Safety: if changedMask is 0, nothing to write — emit empty mask so the
         // outer wire format stays valid. Filter at QueryHandler/UpdateHandler will
@@ -1638,6 +1659,7 @@ public partial class ObjectUpdateBuilder
             BuildMovementUpdate(packet);
         }
         WriteValuesModern(packet);
+        RecordDiagnostic();
 
         // Hex-dump the produced packet body so we can correlate with the client crash dump.
         // Limited to first 80 bytes to avoid log spam — the header + first descriptor section
@@ -1690,5 +1712,27 @@ public partial class ObjectUpdateBuilder
                 $"[CreateObjectHex] guid={_updateData.Guid} entry={_updateData.ObjectData?.EntryID?.ToString() ?? "null"} " +
                 $"type={_objectType} bytes={len} first256={hex}");
         }
+    }
+
+    private void RecordDiagnostic()
+    {
+        var sections = new List<string>();
+        uint mask = _updateData.Type == UpdateTypeModern.Values
+            ? _lastValuesChangedMask
+            : ConvertTypeMask(_objectTypeMask);
+        if ((mask & 0x001) != 0) sections.Add("Object");
+        if ((mask & 0x002) != 0) sections.Add("Item");
+        if ((mask & 0x004) != 0) sections.Add("Container");
+        if ((mask & 0x020) != 0) sections.Add("Unit");
+        if ((mask & 0x040) != 0) sections.Add("Player");
+        if ((mask & 0x080) != 0) sections.Add("ActivePlayer");
+        if ((mask & 0x100) != 0) sections.Add("GameObject");
+        if ((mask & 0x200) != 0) sections.Add("DynamicObject");
+        if ((mask & 0x400) != 0) sections.Add("Corpse");
+
+        (_gameState.ObjectUpdateDiagnostics ??= new ObjectUpdateDiagnosticTracker()).Record(
+            _updateData.Guid, _objectType.ToString(), _updateData.Type,
+            sections.Count == 0 ? "Empty" : string.Join(',', sections),
+            _updateData.FixtureReference);
     }
 }

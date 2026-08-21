@@ -60,6 +60,7 @@ public partial class WorldClient
     FrozenDictionary<Opcode, Action<WorldPacket>> _packetHandlers = null!;
     GlobalSessionData _globalSession = null!;
     readonly Lock _sendLock = new();
+    BoundedSocketWriteQueue? _writeQueue;
     readonly Lock _delayedPacketsLock = new();
     readonly AsyncLocal<ProxyLifecycle?> _activeLifecycle = new();
     Timer? _keepAliveTimer;
@@ -145,6 +146,8 @@ public partial class WorldClient
     public void Disconnect()
     {
         StopKeepAliveTimer();
+        _writeQueue?.Dispose();
+        _writeQueue = null;
 
         if (!IsConnected())
             return;
@@ -187,6 +190,12 @@ public partial class WorldClient
             bool forceNoDelay = _globalSession.NetworkOptions.ForceTcpNoDelay;
             _clientSocket.NoDelay = forceNoDelay;
             Log.Print(LogType.Network, $"Legacy world socket TCP_NODELAY={_clientSocket.NoDelay} (forced={forceNoDelay})");
+            _writeQueue = new BoundedSocketWriteQueue(
+                (data, cancellationToken) => _clientSocket.SendAsync(data, SocketFlags.None, cancellationToken),
+                maxItems: 256,
+                maxBytes: 4 * 1024 * 1024,
+                HandleWriteQueueFailure);
+            GetSession().TransitionTo(SessionLifecycleState.Authenticating);
 
             _ = Task.Run(ReceiveLoop);
         }
@@ -224,7 +233,10 @@ public partial class WorldClient
     private void HandleDisconnect(string reason)
     {
         Log.PrintNet(LogType.Error, LogNetDir.S2P, $"Socket Closed By GameWorldServer ({reason})");
-        HermesProxy.Server.Telemetry?.Record("connection_unexpected_disconnect", "server_to_client", null, reason);
+        if (GetSession().IsExpectedShutdown || HermesProxy.Server.IsShuttingDown)
+            GetSession().MarkExpectedShutdown($"legacy_eof:{reason}");
+        else
+            GetSession().MarkFault($"legacy_eof:{reason}");
         if (_isSuccessful == null)
         {
             _isSuccessful = false;
@@ -303,11 +315,7 @@ public partial class WorldClient
         }
     }
 
-    // C P>S: Sends data to world server.
-    // Wave 2-C send-loop refactor was reverted on this side after a regression: the legacy
-    // server forcibly closed the connection after our CMSG_AUTH_SESSION when SendPacket
-    // hopped onto a SendLoopAsync task. Until that interaction is understood, the legacy
-    // outbound path stays synchronous-under-lock. The Wave 1 `using ByteBuffer` is kept.
+    // C P>S: packet framing and encryption are serialized here; the bounded writer owns I/O.
     private void SendPacket(WorldPacket packet, ProxyLifecycle? lifecycle = null)
     {
         lock (_sendLock)
@@ -331,9 +339,11 @@ public partial class WorldClient
 
                 buffer.WriteBytes(packet.GetData(), packet.GetSize());
 
-                SendAll(buffer.GetData());
-                if (lifecycle != null && HermesProxy.Server.MetricsEnabled)
-                    HermesProxy.Server.Metrics.MarkLegacySent(lifecycle);
+                Action? onSent = lifecycle != null && HermesProxy.Server.MetricsEnabled
+                    ? () => HermesProxy.Server.Metrics.MarkLegacySent(lifecycle)
+                    : null;
+                if (_writeQueue == null || !_writeQueue.TryEnqueue(buffer.GetData(), onSent))
+                    throw new SocketException((int)SocketError.ConnectionReset);
             }
             catch (Exception ex)
             {
@@ -344,41 +354,36 @@ public partial class WorldClient
         }
     }
 
-    private void SendAll(byte[] data)
+    private void HandleWriteQueueFailure(Exception exception)
     {
-        int offset = 0;
-        while (offset < data.Length)
-        {
-            int sent = _clientSocket.Send(data, offset, data.Length - offset, SocketFlags.None);
-            if (sent <= 0)
-                throw new SocketException((int)SocketError.ConnectionReset);
-            offset += sent;
-        }
+        Log.PrintNet(LogType.Error, LogNetDir.P2S, $"Packet Write Error: {exception.Message}");
+        if (GetSession().IsExpectedShutdown)
+            GetSession().MarkExpectedShutdown($"legacy_write_after_shutdown:{exception.GetType().Name}");
+        else
+            GetSession().MarkFault($"legacy_write:{exception.GetType().Name}");
+        Disconnect();
     }
 
     public void SendPacketToClient(ServerPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION)
     {
-        lock (GetSession().PacketOrderLock)
+        Opcode opcode = packet.GetUniversalOpcode();
+        if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
         {
-            Opcode opcode = packet.GetUniversalOpcode();
-            if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
+            lock (_delayedPacketsLock)
             {
-                lock (_delayedPacketsLock)
+                if (!_delayedPacketsToClient.TryGetValue(delayUntilOpcode, out var packets))
                 {
-                    if (!_delayedPacketsToClient.TryGetValue(delayUntilOpcode, out var packets))
-                    {
-                        packets = new OrderedPacketQueue<ServerPacket>();
-                        _delayedPacketsToClient.Add(delayUntilOpcode, packets);
-                    }
-
-                    packets.Enqueue(packet);
+                    packets = new OrderedPacketQueue<ServerPacket>();
+                    _delayedPacketsToClient.Add(delayUntilOpcode, packets);
                 }
-                return;
-            }
 
-            SendPacketToClientDirect(packet, _activeLifecycle.Value);
-            SendDelayedPacketsToClientOnOpcode(opcode);
+                packets.Enqueue(packet);
+            }
+            return;
         }
+
+        SendPacketToClientDirect(packet, _activeLifecycle.Value);
+        SendDelayedPacketsToClientOnOpcode(opcode);
     }
 
     private void SendPacketToClientDirect(ServerPacket packet, ProxyLifecycle? lifecycle = null)
@@ -449,27 +454,24 @@ public partial class WorldClient
 
     public void SendPacketToServer(WorldPacket packet, Opcode delayUntilOpcode = Opcode.MSG_NULL_ACTION, ProxyLifecycle? lifecycle = null)
     {
-        lock (GetSession().PacketOrderLock)
+        Opcode opcode = packet.GetUniversalOpcode(false);
+        if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
         {
-            Opcode opcode = packet.GetUniversalOpcode(false);
-            if (delayUntilOpcode != Opcode.MSG_NULL_ACTION)
+            lock (_delayedPacketsLock)
             {
-                lock (_delayedPacketsLock)
+                if (!_delayedPacketsToServer.TryGetValue(delayUntilOpcode, out var packets))
                 {
-                    if (!_delayedPacketsToServer.TryGetValue(delayUntilOpcode, out var packets))
-                    {
-                        packets = new OrderedPacketQueue<WorldPacket>();
-                        _delayedPacketsToServer.Add(delayUntilOpcode, packets);
-                    }
-
-                    packets.Enqueue(packet);
+                    packets = new OrderedPacketQueue<WorldPacket>();
+                    _delayedPacketsToServer.Add(delayUntilOpcode, packets);
                 }
-                return;
-            }
 
-            SendPacket(packet, lifecycle);
-            SendDelayedPacketsToServerOnOpcode(opcode);
+                packets.Enqueue(packet);
+            }
+            return;
         }
+
+        SendPacket(packet, lifecycle);
+        SendDelayedPacketsToServerOnOpcode(opcode);
     }
 
     private void SendDelayedPacketsToServerOnOpcode(Opcode opcode)
@@ -499,73 +501,73 @@ public partial class WorldClient
 
     private void HandlePacket(WorldPacket packet)
     {
-        lock (GetSession().PacketOrderLock)
+        Opcode universalOpcode = packet.GetUniversalOpcode(false);
+        WorldClientLogMessages.PacketReceived(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
+        MovementTrace.Record("legacy-in", universalOpcode, packet.GetOpcode());
+
+        long startTimestamp = HermesProxy.Server.MetricsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        ProxyLifecycle? lifecycle = null;
+        var responseFlow = ProxyFlowClassifier.ForLegacyResponse(universalOpcode);
+        if (HermesProxy.Server.MetricsEnabled && responseFlow is ProxyFlow flow)
         {
-            Opcode universalOpcode = packet.GetUniversalOpcode(false);
-            WorldClientLogMessages.PacketReceived(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
-
-            long startTimestamp = HermesProxy.Server.MetricsEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-            ProxyLifecycle? lifecycle = null;
-            var responseFlow = ProxyFlowClassifier.ForLegacyResponse(universalOpcode);
-            if (HermesProxy.Server.MetricsEnabled && responseFlow is ProxyFlow flow)
+            lifecycle = flow switch
             {
-                lifecycle = flow switch
-                {
-                    ProxyFlow.LootResponse or ProxyFlow.LootList => GetSession().TakeProxyLifecycle(ProxyFlow.Loot, ProxyFlow.LootItem),
-                    ProxyFlow.LootItem => GetSession().TakeProxyLifecycle(ProxyFlow.LootItem),
-                    ProxyFlow.ObjectUpdate => GetSession().TakeProxyLifecycle(ProxyFlow.Selection),
-                    _ => GetSession().TakeProxyLifecycle(flow)
-                };
+                ProxyFlow.LootResponse or ProxyFlow.LootList => GetSession().TakeProxyLifecycle(ProxyFlow.Loot, ProxyFlow.LootItem),
+                ProxyFlow.LootItem => GetSession().TakeProxyLifecycle(ProxyFlow.LootItem),
+                ProxyFlow.ObjectUpdate => GetSession().TakeProxyLifecycle(ProxyFlow.Selection),
+                _ => GetSession().TakeProxyLifecycle(flow)
+            };
 
-                if (lifecycle == null)
-                {
-                    lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(flow.ToString(), (int)universalOpcode);
-                    HermesProxy.Server.Metrics.MarkLegacySent(lifecycle);
-                }
-
-                HermesProxy.Server.Metrics.MarkLegacyReceived(lifecycle);
+            if (lifecycle == null)
+            {
+                lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(flow.ToString(), (int)universalOpcode);
+                HermesProxy.Server.Metrics.MarkLegacySent(lifecycle);
             }
 
-            var previousLifecycle = _activeLifecycle.Value;
-            _activeLifecycle.Value = lifecycle;
-            try
+            HermesProxy.Server.Metrics.MarkLegacyReceived(lifecycle);
+        }
+
+        var previousLifecycle = _activeLifecycle.Value;
+        _activeLifecycle.Value = lifecycle;
+        try
+        {
+            switch (universalOpcode)
             {
-                switch (universalOpcode)
-                {
-                    case Opcode.SMSG_AUTH_CHALLENGE:
-                        HandleAuthChallenge(packet);
-                        break;
-                    case Opcode.SMSG_AUTH_RESPONSE:
-                        HandleAuthResponse(packet);
-                        break;
-                    case Opcode.SMSG_ADDON_INFO:
-                        break; // don't need to handle
-                    default:
-                        if (_packetHandlers.TryGetValue(universalOpcode, out var handler))
-                        {
-                            handler(packet);
-                        }
+                case Opcode.SMSG_AUTH_CHALLENGE:
+                    HandleAuthChallenge(packet);
+                    break;
+                case Opcode.SMSG_AUTH_RESPONSE:
+                    HandleAuthResponse(packet);
+                    break;
+                case Opcode.SMSG_ADDON_INFO:
+                    break;
+                default:
+                    if (_packetHandlers.TryGetValue(universalOpcode, out var handler))
+                        handler(packet);
                         else
                         {
-                            RecordUnknownOpcode(universalOpcode, packet.GetOpcode(), "server_to_client");
-                            WorldClientLogMessages.NoHandlerForOpcode(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
+                            var record = universalOpcode == Opcode.MSG_NULL_ACTION
+                                ? ModernOnlyCompatibilityMatrix.DescribeUnmappedWireOpcode(ModernOnlyDirection.ServerToClient, packet.GetOpcode())
+                                : ModernOnlyCompatibilityMatrix.TryGet(universalOpcode, ModernOnlyDirection.ServerToClient, out var classified)
+                                    ? classified
+                                    : new ModernOnlyCompatibilityRecord(universalOpcode, ModernOnlyDirection.ServerToClient, ModernOnlyDisposition.CaptureRequired,
+                                        $"LEGACY-UNHANDLED-{universalOpcode}", "unclassified", "unknown", universalOpcode.ToString(), "");
+                            if (ModernOnlyCompatibilityMatrix.Record(record))
+                                Log.Print(LogType.Warn, $"[{record.InvestigationId}] {record.Name} class={record.Disposition} subsystem={record.Subsystem} wire=0x{packet.GetOpcode():X}");
                             if (_isSuccessful == null && !IsIgnorableDuringHandshake(universalOpcode))
                                 _isSuccessful = false;
-                        }
-                        break;
-                }
-
-                if (HermesProxy.Server.MetricsEnabled)
-                {
-                    HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
-                }
-
-                SendDelayedPacketsToServerOnOpcode(universalOpcode);
+                    }
+                    break;
             }
-            finally
-            {
-                _activeLifecycle.Value = previousLifecycle;
-            }
+
+            if (HermesProxy.Server.MetricsEnabled)
+                HermesProxy.Server.Metrics.RecordServerToClientLatency(universalOpcode, Stopwatch.GetElapsedTime(startTimestamp).Ticks);
+
+            SendDelayedPacketsToServerOnOpcode(universalOpcode);
+        }
+        finally
+        {
+            _activeLifecycle.Value = previousLifecycle;
         }
     }
 
@@ -691,6 +693,7 @@ public partial class WorldClient
                 GetSession().RealmSocket.SendAuthWaitQue(_queuePosition);
             }
             _isSuccessful = true;
+            GetSession().TransitionTo(SessionLifecycleState.RealmReady);
             StartKeepAliveTimer();
         }
         else if (result == AuthResult.AUTH_WAIT_QUEUE)

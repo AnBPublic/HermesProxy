@@ -15,14 +15,14 @@
     "sourcePayloadHex": "010000000000000001010102",
     "expected": {
       "outcome": "translated",
-      "wireOpcode": "0x281D",
+      "wireOpcode": "0x2741",
       "connectionType": "Instance",
       "payloadHex": "01A001040801A001043CC001A001040801A0020408",
       "semanticFields": {
         "owner.low": "1",
         "owner.high": "576465150349934592",
         "lootObject.low": "1",
-        "lootObject.high": "4323457845597372416",
+        "lootObject.high": "4323460040322187264",
         "master.low": "1",
         "roundRobin.low": "2"
       }
@@ -45,7 +45,7 @@
     "sourcePayloadHex": "01000000000000000000",
     "expected": {
       "outcome": "translated",
-      "wireOpcode": "0x281D",
+      "wireOpcode": "0x2741",
       "connectionType": "Instance",
       "payloadHex": "01A001040801A001043C00",
       "semanticFields": { "owner.low": "1", "master.low": "0", "roundRobin.low": "0" }
@@ -97,5 +97,22 @@
       "semanticFields": { "failure": "empty-owner" }
     },
     "evidence": { "kind": "syntheticMalformed", "source": "empty loot owner", "sanitized": true }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "loot-list-fuzz-all-bits",
+    "flow": "loot",
+    "case": "fuzz",
+    "translation": "legacy.loot-list",
+    "direction": "legacyToModern",
+    "wireOpcode": "0x03F9",
+    "connectionType": "Instance",
+    "backendDialect": "Common",
+    "observedDialects": [ "CMaNGOS", "TrinityCore", "AzerothCore", "Maelstrom" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "FFFFFFFFFFFFFFFFFFFF",
+    "expected": { "outcome": "rejected", "wireOpcode": "0x0000", "connectionType": "Instance", "payloadHex": "", "semanticFields": { "failure": "fuzz" } },
+    "evidence": { "kind": "deterministicFuzz", "source": "all-bit packed GUID masks with missing bodies", "sanitized": true }
   }
 ]

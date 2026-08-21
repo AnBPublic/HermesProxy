@@ -62,6 +62,7 @@ internal sealed class ProxyHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        Server.SetShuttingDown(false);
 #if !DEBUG
         if (_diagnosticsOptions.Value.EnableVersionCheck)
         {
@@ -171,6 +172,8 @@ internal sealed class ProxyHostedService : BackgroundService
         catch (OperationCanceledException) { /* normal shutdown */ }
         finally
         {
+            Server.SetShuttingDown(true);
+            Server.Telemetry?.Record("connection_expected_shutdown", detail: "proxy_host_stopping");
             TryStop(_worldSocketManager);
             TryStop(_realmSocketManager);
             TryStop(_restSocketManager);

@@ -1,5 +1,9 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace HermesProxy.Tests.ProtocolReplay;
@@ -29,7 +33,7 @@ public sealed class PacketReplayFixtureTests
             for (var iteration = 0; iteration < 8; iteration++)
             {
                 var actual = PacketReplayHarness.Replay(fixture);
-                if (!Equals(expected[fixture.Id], actual))
+                if (expected[fixture.Id].Canonical() != actual.Canonical())
                     failures.Enqueue($"{fixture.Id} changed on iteration {iteration}");
             }
         });
@@ -59,6 +63,7 @@ public sealed class PacketReplayFixtureTests
         Assert.Contains(BackendDialect.TrinityCore, dialects);
         Assert.Contains(BackendDialect.AzerothCore, dialects);
         Assert.Contains(BackendDialect.Maelstrom, dialects);
+        Assert.Contains(fixtures, fixture => fixture.Case == PacketCase.Fuzz && fixture.Expected.Outcome == ReplayOutcome.Rejected);
     }
 
     [Theory]

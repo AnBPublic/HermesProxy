@@ -45,6 +45,26 @@ public class CloseInteraction : ClientPacket
         SourceGuid = _worldPacket.ReadPackedGuid128();
     }
 
+    internal static bool TryBuildLegacyCancel(GameSessionData state, WowGuid128 sourceGuid, out WorldPacket packet)
+    {
+        bool closesNpc = state.CurrentInteractedWithNPC == sourceGuid;
+        bool closesGameObject = state.CurrentInteractedWithGO == sourceGuid;
+        if (!closesNpc && !closesGameObject)
+        {
+            packet = null!;
+            return false;
+        }
+
+        if (closesNpc)
+            state.CurrentInteractedWithNPC = default;
+        if (closesGameObject)
+            state.CurrentInteractedWithGO = default;
+
+        // 3.3.5a exposes the close path as CMSG_QUEST_GIVER_CANCEL (0x190).
+        packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_CANCEL);
+        return true;
+    }
+
     public WowGuid128 SourceGuid;
 }
 

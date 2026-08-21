@@ -128,6 +128,12 @@ public partial class WorldClient
         MovementInfo moveInfo = new();
         moveInfo.ReadMovementInfoLegacy(packet, GetSession().GameState);
         moveInfo.Flags = (uint)(((MovementFlagWotLK)moveInfo.Flags).CastFlags<MovementFlagModern>());
+        if (guid == GetSession().GameState.CurrentPlayerGuid)
+        {
+            GetSession().GameState.Movement.RecordServerCorrection(Environment.TickCount64);
+            MovementTrace.Record("legacy-correction", packet.GetUniversalOpcode(false), packet.GetOpcode(),
+                $"count={GetSession().GameState.Movement.CorrectionCount} delayMs={GetSession().GameState.Movement.LastCorrectionDelayMs}");
+        }
         moveInfo.ValidateMovementInfo();
         teleport.Position = moveInfo.Position;
         teleport.Orientation = moveInfo.Orientation;

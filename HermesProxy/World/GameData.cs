@@ -79,7 +79,7 @@ public static partial class GameData
     public static FrozenDictionary<int /*worldMapAreaId (legacy 3.3.5a)*/, int /*uiMapId (V3_4_3)*/> WorldMapAreaIDToUiMapID = FrozenDictionary<int, int>.Empty;
 
     // From Server
-    public static Dictionary<uint, ItemTemplate> ItemTemplates = [];
+    public static BoundedItemTemplateCache ItemTemplates = new(4096);
     public static Dictionary<uint, CreatureTemplate> CreatureTemplates = [];
     public static Dictionary<uint, QuestTemplate> QuestTemplates = [];
     public static Dictionary<uint, string> ItemNames = [];
@@ -104,7 +104,7 @@ public static partial class GameData
 
     public static void StoreItemTemplate(uint entry, ItemTemplate template)
     {
-        CollectionsMarshal.GetValueRefOrAddDefault(ItemTemplates, entry, out _) = template;
+        ItemTemplates.Store(entry, template);
     }
 
     public static ItemTemplate? GetItemTemplate(uint entry)

@@ -20,6 +20,7 @@ public sealed class BoundedSocketWriteQueue : IDisposable
     private int _pendingItems;
     private long _pendingBytes;
     private int _disposed;
+    private int _failureReported;
 
     public BoundedSocketWriteQueue(
         Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<int>> send,
@@ -73,7 +74,7 @@ public sealed class BoundedSocketWriteQueue : IDisposable
             }
         }
 
-        _failureCallback?.Invoke(rejection);
+        ReportFailure(rejection);
         return false;
     }
 
@@ -89,6 +90,7 @@ public sealed class BoundedSocketWriteQueue : IDisposable
 
         _queue.Writer.TryComplete();
         _cancellation.Cancel();
+        CompleteOutstanding();
     }
 
     private async Task RunAsync()
@@ -122,17 +124,11 @@ public sealed class BoundedSocketWriteQueue : IDisposable
         }
         catch (OperationCanceledException) when (_cancellation.IsCancellationRequested)
         {
+            CompleteOutstanding();
         }
         catch (Exception ex)
         {
-            lock (_stateLock)
-            {
-                _pendingItems = 0;
-                _pendingBytes = 0;
-                _idle.TrySetException(ex);
-            }
-
-            _failureCallback?.Invoke(ex);
+            Fail(ex);
         }
     }
 
@@ -145,6 +141,34 @@ public sealed class BoundedSocketWriteQueue : IDisposable
             if (_pendingItems == 0)
                 _idle.TrySetResult(null);
         }
+    }
+
+    private void CompleteOutstanding(Exception? exception = null)
+    {
+        lock (_stateLock)
+        {
+            _pendingItems = 0;
+            _pendingBytes = 0;
+            if (exception == null)
+                _idle.TrySetResult(null);
+            else
+                _idle.TrySetException(exception);
+        }
+    }
+
+    private void ReportFailure(Exception? exception)
+    {
+        if (exception != null && Interlocked.Exchange(ref _failureReported, 1) == 0)
+            _failureCallback?.Invoke(exception);
+    }
+
+    private void Fail(Exception exception)
+    {
+        Interlocked.Exchange(ref _disposed, 1);
+        _queue.Writer.TryComplete(exception);
+        _cancellation.Cancel();
+        CompleteOutstanding(exception);
+        ReportFailure(exception);
     }
 
     private static TaskCompletionSource<object?> CompletedIdle()

@@ -335,6 +335,8 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             case Opcode.CMSG_LOG_DISCONNECT:
                 uint reason = packet.ReadUInt32();
                 Log.Print(LogType.Server, $"Client disconnected with reason {reason}.");
+                if (reason == 0)
+                    GetSession().MarkExpectedShutdown("wow_exited");
 
                 // [ActionBarTrace] Dump the recent SMSG history. Reason 7 is
                 // "client rejected a server packet"; the offending packet is
@@ -363,21 +365,18 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
                 break;
             case Opcode.CMSG_ENABLE_NAGLE:
-                lock (GetSession().PacketOrderLock)
-                {
-                    bool forceNoDelay = GetSession().NetworkOptions.ForceTcpNoDelay;
-                    bool noDelay = TcpNoDelayPolicy.Resolve(forceNoDelay, clientRequestedNagle: true);
-                    SetNoDelay(noDelay);
-                    GetSession().WorldClient?.SetNoDelay(noDelay);
-                    Log.Print(LogType.Network, $"TCP_NODELAY request received: requestedNagle=true forced={forceNoDelay} modern={GetNoDelay()} legacy={GetSession().WorldClient?.GetNoDelay()}");
-                    HermesProxy.Server.Telemetry?.Record(
-                        "nagle_requested",
-                        "client_to_server",
-                        nameof(Opcode.CMSG_ENABLE_NAGLE),
-                        $"forced={forceNoDelay};modernNoDelay={GetNoDelay()};legacyNoDelay={GetSession().WorldClient?.GetNoDelay()}");
-                    if (!noDelay || GetSession().WorldClient?.GetNoDelay() == false)
-                        HermesProxy.Server.Telemetry?.Record("socket_no_delay_false", "client_to_server", nameof(Opcode.CMSG_ENABLE_NAGLE));
-                }
+                bool forceNoDelay = GetSession().NetworkOptions.ForceTcpNoDelay;
+                bool noDelay = TcpNoDelayPolicy.Resolve(forceNoDelay, clientRequestedNagle: true);
+                SetNoDelay(noDelay);
+                GetSession().WorldClient?.SetNoDelay(noDelay);
+                Log.Print(LogType.Network, $"TCP_NODELAY request received: requestedNagle=true forced={forceNoDelay} modern={GetNoDelay()} legacy={GetSession().WorldClient?.GetNoDelay()}");
+                HermesProxy.Server.Telemetry?.Record(
+                    "nagle_requested",
+                    "client_to_server",
+                    nameof(Opcode.CMSG_ENABLE_NAGLE),
+                    $"forced={forceNoDelay};modernNoDelay={GetNoDelay()};legacyNoDelay={GetSession().WorldClient?.GetNoDelay()}");
+                if (!noDelay || GetSession().WorldClient?.GetNoDelay() == false)
+                    HermesProxy.Server.Telemetry?.Record("socket_no_delay_false", "client_to_server", nameof(Opcode.CMSG_ENABLE_NAGLE));
                 break;
             case Opcode.CMSG_CONNECT_TO_FAILED:
                 ConnectToFailed connectToFailed = new(packet);
@@ -401,43 +400,61 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
     public void HandlePacket(WorldPacket packet)
     {
         Opcode universalOpcode = packet.GetUniversalOpcode(isModern: true);
+        MovementTrace.Record("modern-in", universalOpcode, packet.GetOpcode());
         var handler = GetHandler(universalOpcode);
         if (handler != null)
         {
-            lock (GetSession().PacketOrderLock)
+            long startTimestamp = HermesProxy.Server.MetricsEnabled ? Stopwatch.GetTimestamp() : 0;
+            ProxyLifecycle? lifecycle = null;
+            var flow = ProxyFlowClassifier.ForClientRequest(universalOpcode);
+            if (HermesProxy.Server.MetricsEnabled && flow is ProxyFlow requestFlow)
             {
-                long startTimestamp = HermesProxy.Server.MetricsEnabled ? Stopwatch.GetTimestamp() : 0;
-                ProxyLifecycle? lifecycle = null;
-                var flow = ProxyFlowClassifier.ForClientRequest(universalOpcode);
-                if (HermesProxy.Server.MetricsEnabled && flow is ProxyFlow requestFlow)
-                {
-                    lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(requestFlow.ToString(), (int)universalOpcode);
-                    GetSession().RegisterProxyLifecycle(requestFlow, lifecycle);
-                }
+                lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(requestFlow.ToString(), (int)universalOpcode);
+                GetSession().RegisterProxyLifecycle(requestFlow, lifecycle);
+                HermesProxy.Server.Telemetry?.Record($"lifecycle_exercised.{requestFlow}", "client_to_server", universalOpcode.ToString());
+            }
 
-                var previousLifecycle = _activeLifecycle.Value;
-                _activeLifecycle.Value = lifecycle;
-                try
+            var previousLifecycle = _activeLifecycle.Value;
+            _activeLifecycle.Value = lifecycle;
+            try
+            {
+                handler.Invoke(this, packet);
+            }
+            finally
+            {
+                _activeLifecycle.Value = previousLifecycle;
+                if (HermesProxy.Server.MetricsEnabled)
                 {
-                    handler.Invoke(this, packet);
-                }
-                finally
-                {
-                    _activeLifecycle.Value = previousLifecycle;
-                    if (HermesProxy.Server.MetricsEnabled)
-                    {
-                        HermesProxy.Server.Metrics.RecordClientToServerLatency(
-                            universalOpcode,
-                            Stopwatch.GetElapsedTime(startTimestamp).Ticks);
-                    }
+                    HermesProxy.Server.Metrics.RecordClientToServerLatency(
+                        universalOpcode,
+                        Stopwatch.GetElapsedTime(startTimestamp).Ticks);
                 }
             }
         }
         else
         {
-            RecordUnknownOpcode(universalOpcode, packet.GetOpcode(), "client_to_server");
-            WorldSocketLogMessages.NoHandlerForOpcode(_melLog, _sourceFile, _netDirRecv, universalOpcode, packet.GetOpcode());
+            if (ModernOnlyCompatibilityMatrix.TryGet(universalOpcode, ModernOnlyDirection.ClientToServer, out var record))
+            {
+                HandleModernOnlyCompatibilityPacket(record);
+            }
+            else
+            {
+                var unknown = universalOpcode == Opcode.MSG_NULL_ACTION
+                    ? ModernOnlyCompatibilityMatrix.DescribeUnmappedWireOpcode(ModernOnlyDirection.ClientToServer, packet.GetOpcode())
+                    : new ModernOnlyCompatibilityRecord(universalOpcode, ModernOnlyDirection.ClientToServer, ModernOnlyDisposition.CaptureRequired,
+                        $"MODERN-UNHANDLED-{universalOpcode}", "unclassified", "unknown", universalOpcode.ToString(), "");
+                if (ModernOnlyCompatibilityMatrix.Record(unknown))
+                    Log.Print(LogType.Warn, $"[{unknown.InvestigationId}] {unknown.Name} class={unknown.Disposition} subsystem={unknown.Subsystem} wire=0x{packet.GetOpcode():X}");
+            }
         }
+    }
+
+    private void HandleModernOnlyCompatibilityPacket(ModernOnlyCompatibilityRecord record)
+    {
+        if (ModernOnlyCompatibilityMatrix.Record(record))
+            Log.Print(LogType.Warn, $"[{record.InvestigationId}] {record.Name} class={record.Disposition} subsystem={record.Subsystem}");
+        if (record.Disposition != ModernOnlyDisposition.SafeIgnoredNotification && !string.IsNullOrWhiteSpace(record.UserMessage))
+            SendPacket(new ChatPkt(GetSession(), ChatMessageTypeModern.System, record.UserMessage));
     }
 
     private static void RecordUnknownOpcode(Opcode universalOpcode, uint wireOpcode, string direction)
@@ -623,6 +640,13 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
 
     public override void OnClose()
     {
+        if (_globalSession != null)
+        {
+            if (_globalSession.IsExpectedShutdown || HermesProxy.Server.IsShuttingDown)
+                _globalSession.MarkExpectedShutdown("modern_socket_eof");
+            else
+                _globalSession.MarkFault("modern_socket_eof");
+        }
         base.OnClose();
     }
 
@@ -905,6 +929,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             SendBnetConnectionState(1);
             GetSession().AccountDataMgr = new AccountDataManager(GetSession().Username, GetSession().RealmManager.GetRealm(_realmId)!.Name);
             GetSession().RealmSocket = this;
+            GetSession().TransitionTo(SessionLifecycleState.RealmReady);
 
             // Flush any Realm-destined packets the legacy WorldClient queued before this
             // socket was ready. See WorldClient.SendPacketToClientDirect for the producer.
@@ -923,6 +948,7 @@ public partial class WorldSocket : SocketBase, BnetServices.INetwork
             Log.Print(LogType.Server, "Client has connected to the instance server.");
             SendPacket(new ResumeComms(ConnectionType.Instance));
             GetSession().InstanceSocket = this;
+            GetSession().TransitionTo(SessionLifecycleState.InstanceReady);
         }
     }
 

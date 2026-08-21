@@ -14,6 +14,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HermesProxy.Tests", "HermesProxy.Tests\HermesProxy.Tests.csproj", "{830D3C72-6956-AAC0-C8EA-31067AF5B584}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HermesProxy.ProtocolReplay.Tests", "HermesProxy.Tests\HermesProxy.ProtocolReplay.Tests.csproj", "{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HermesProxy.Benchmarks", "HermesProxy.Benchmarks\HermesProxy.Benchmarks.csproj", "{4B42196A-E998-4C83-8907-C8108227E900}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HermesProxy.SourceGen", "HermesProxy.SourceGen\HermesProxy.SourceGen.csproj", "{6F4D8D53-2D50-417A-B73E-4B493C3D6550}"
@@ -64,6 +66,18 @@ Global
 		{830D3C72-6956-AAC0-C8EA-31067AF5B584}.Release|x64.Build.0 = Release|Any CPU
 		{830D3C72-6956-AAC0-C8EA-31067AF5B584}.Release|x86.ActiveCfg = Release|Any CPU
 		{830D3C72-6956-AAC0-C8EA-31067AF5B584}.Release|x86.Build.0 = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|x64.Build.0 = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Debug|x86.Build.0 = Debug|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|x64.ActiveCfg = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|x64.Build.0 = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|x86.ActiveCfg = Release|Any CPU
+		{A7A3C6C4-D87F-4E7D-8B8C-97C551D29221}.Release|x86.Build.0 = Release|Any CPU
 		{4B42196A-E998-4C83-8907-C8108227E900}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{4B42196A-E998-4C83-8907-C8108227E900}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4B42196A-E998-4C83-8907-C8108227E900}.Debug|x64.ActiveCfg = Debug|Any CPU

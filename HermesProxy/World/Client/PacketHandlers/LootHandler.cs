@@ -15,7 +15,6 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_LOOT_RESPONSE)]
     void HandleLootResponse(WorldPacket packet)
     {
-        LootResponse loot = new();
         var state = GetSession().GameState;
         // Reset before anything else so a failed loot doesn't leak stale counters.
         state.RemainingLootSlots.Clear();
@@ -23,6 +22,15 @@ public partial class WorldClient
         state.ExpectingLootReleaseResponse = false;
         state.LootMoneyPreClaimed = false;
 
+        LootResponse loot = ParseLootResponse(packet, state);
+        if (loot.AcquireReason != LootType.None)
+            SendMasterLootListIfApplicable();
+        SendPacketToClient(loot);
+    }
+
+    internal static LootResponse ParseLootResponse(WorldPacket packet, GameSessionData state)
+    {
+        LootResponse loot = new();
         state.LastLootTargetGuid = packet.ReadGuid();
         loot.Owner = state.LastLootTargetGuid.To128(state);
         loot.LootObj = state.LastLootTargetGuid.ToLootGuid();
@@ -30,12 +38,11 @@ public partial class WorldClient
         if (loot.AcquireReason == LootType.None)
         {
             loot.FailureReason = (LootError)packet.ReadUInt8();
-            return;
+            return loot;
         }
+
         loot.LootMethod = state.GetCurrentLootMethod();
-
         loot.Coins = packet.ReadUInt32();
-
         var itemsCount = packet.ReadUInt8();
         for (var i = 0; i < itemsCount; ++i)
         {
@@ -52,8 +59,23 @@ public partial class WorldClient
             state.RemainingLootSlots.Add(lootItem.LootListID);
         }
         state.RemainingLootCoins = loot.Coins;
-        SendMasterLootListIfApplicable();
-        SendPacketToClient(loot);
+        return loot;
+    }
+
+    [PacketHandler(Opcode.SMSG_LOOT_LIST)]
+    void HandleLootList(WorldPacket packet)
+        => SendPacketToClient(ParseLootList(packet, GetSession().GameState));
+
+    internal static LootList ParseLootList(WorldPacket packet, GameSessionData state)
+    {
+        WowGuid64 owner = packet.ReadGuid();
+        return new LootList
+        {
+            Owner = owner.To128(state),
+            LootObj = owner.ToLootGuid(),
+            Master = packet.ReadPackedGuid().To128(state),
+            RoundRobinWinner = packet.ReadPackedGuid().To128(state)
+        };
     }
 
     [PacketHandler(Opcode.SMSG_LOOT_RELEASE)]

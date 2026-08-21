@@ -86,6 +86,7 @@ public class ObjectUpdate
 
     public UpdateTypeModern Type;
     public WowGuid128 Guid;
+    public string FixtureReference = "live";
     public GlobalSessionData GlobalSession;
     public CreateObjectData CreateData = null!;
     public ObjectData ObjectData;
@@ -325,8 +326,27 @@ public class UpdateObject : ServerPacket
         if (ModernVersion.Build != ClientVersionBuild.V3_4_3_54261)
             return 0;
 
+        return FilterV3_4_3ValuesCore(obj, gameState);
+    }
+
+    internal static int FilterV3_4_3ValuesCore(UpdateObject obj, GameSessionData gameState)
+    {
+
         int beforeCount = obj.ObjectUpdates.Count;
         var known = gameState.ClientKnownGuids;
+
+        foreach (var guid in obj.DestroyedGuids)
+        {
+            known.Remove(guid);
+            gameState.OriginalObjectTypes.Remove(guid);
+            gameState.ObjectUpdateDiagnostics?.Forget(guid);
+        }
+        foreach (var guid in obj.OutOfRangeGuids)
+        {
+            known.Remove(guid);
+            gameState.OriginalObjectTypes.Remove(guid);
+            gameState.ObjectUpdateDiagnostics?.Forget(guid);
+        }
 
         // First pass: register every CreateObject in this batch as a guid the client
         // will know after this packet is sent. We add BEFORE the strip pass so that a

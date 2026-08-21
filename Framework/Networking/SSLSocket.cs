@@ -22,6 +22,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Framework.Networking;
@@ -32,6 +33,8 @@ public abstract class SSLSocket : ISocket, IDisposable
     internal SslStream _stream;
     IPEndPoint? _remoteEndPoint;
     byte[]? _receiveBuffer;
+    readonly BoundedSocketWriteQueue _writeQueue;
+    int _closed;
 
     protected SSLSocket(Socket socket)
     {
@@ -40,10 +43,20 @@ public abstract class SSLSocket : ISocket, IDisposable
         _receiveBuffer = new byte[ushort.MaxValue];
 
         _stream = new SslStream(new NetworkStream(socket), false);
+        _writeQueue = new BoundedSocketWriteQueue(
+            async (data, cancellationToken) =>
+            {
+                await _stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+                return data.Length;
+            },
+            maxItems: 256,
+            maxBytes: 4 * 1024 * 1024,
+            HandleWriteQueueFailure);
     }
 
     public virtual void Dispose()
     {
+        _writeQueue.Dispose();
         _receiveBuffer = null!;
         _stream.Dispose();
     }
@@ -115,9 +128,16 @@ public abstract class SSLSocket : ISocket, IDisposable
         if (!IsOpen())
             return;
 
+        if (!_writeQueue.TryEnqueue(data))
+            return;
+
         try
         {
-            await _stream.WriteAsync(data, 0, data.Length);
+            await _writeQueue.WaitForIdleAsync().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Socket shutdown cancels any queued write deterministically.
         }
         catch (Exception ex)
         {
@@ -127,15 +147,26 @@ public abstract class SSLSocket : ISocket, IDisposable
 
     public void CloseSocket()
     {
+        if (Interlocked.Exchange(ref _closed, 1) != 0)
+            return;
+
+        _writeQueue.Dispose();
         try
         {
-            _socket.Shutdown(SocketShutdown.Both);
+            if (_socket.Connected)
+                _socket.Shutdown(SocketShutdown.Both);
             _socket.Close();
         }
         catch (Exception ex)
         {
             Log.Print(LogType.Network, $"WorldSocket.CloseSocket: {GetRemoteIpEndPoint()} errored when shutting down socket: {ex.Message}");
         }
+    }
+
+    private void HandleWriteQueueFailure(Exception exception)
+    {
+        Log.Print(LogType.Network, $"TLS socket write failed for {GetRemoteIpEndPoint()}: {exception.Message}");
+        CloseSocket();
     }
 
     public virtual void OnClose() { Dispose(); }

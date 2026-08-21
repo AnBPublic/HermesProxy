@@ -14,7 +14,7 @@ namespace HermesProxy.Telemetry;
 public sealed class ProxyTelemetry : IDisposable
 {
     private static readonly string[] LifecycleNames = [
-        "Selection", "Loot", "LootItem", "LootResponse", "LootList", "ObjectUpdate" ];
+        "Selection", "Loot", "LootItem", "LootResponse", "LootList", "Interaction", "ObjectUpdate" ];
 
     private readonly ProxyMetrics _metrics;
     private readonly ConcurrentQueue<TelemetryEvidence> _pending = new();

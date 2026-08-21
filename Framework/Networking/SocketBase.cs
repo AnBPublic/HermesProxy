@@ -153,9 +153,8 @@ public abstract class SocketBase : ISocket, IDisposable
     }
 
     /// <summary>
-    /// Writes one protocol-critical packet before returning. The modern client expects
-    /// the realm/character-select handshake to be available as one ordered stream; the
-    /// normal bounded queue remains the low-latency path for gameplay traffic.
+    /// Queues a protocol-critical handshake packet on the same single writer used for
+    /// gameplay traffic, preserving one FIFO stream per outbound socket.
     /// </summary>
     protected void SynchronousWrite(byte[] data, Action? onSent = null)
     {

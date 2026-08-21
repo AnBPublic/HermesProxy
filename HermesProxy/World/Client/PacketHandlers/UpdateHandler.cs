@@ -2,6 +2,7 @@
 
 using Framework.GameMath;
 using Framework.Logging;
+using Framework.Metrics;
 using Framework.Util;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
@@ -11,6 +12,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 
 namespace HermesProxy.World.Client;
 
@@ -241,13 +243,7 @@ public partial class WorldClient
             return;
 
         foreach (uint itemId in missingItemTemplates)
-        {
-            WorldPacket packet2 = new WorldPacket(Opcode.CMSG_ITEM_QUERY_SINGLE);
-            packet2.WriteUInt32(itemId);
-            if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
-                packet2.WriteGuid(WowGuid64.Empty);
-            SendPacketToServer(packet2);
-        }
+            RequestItemTemplateIfNeeded(itemId);
 
         int activePlayerUpdateIndex = -1;
         for (int i = 0; i < updateObject.ObjectUpdates.Count; i++)
@@ -306,6 +302,7 @@ public partial class WorldClient
             ObjectUpdate tmp = updateObject.ObjectUpdates[0];
             updateObject.ObjectUpdates[0] = updateObject.ObjectUpdates[activePlayerUpdateIndex];
             updateObject.ObjectUpdates[activePlayerUpdateIndex] = tmp;
+            activePlayerUpdateIndex = 0;
         }
 
         // Fix flag carrier positions on map bugging out when player goes out of range
@@ -365,36 +362,64 @@ public partial class WorldClient
             }
         }
 
-        if (deferredFor != null && deferredFor.Count > 0)
+        var itemQuerySession = GetSession();
+        List<uint>? itemQueryRequests = null;
+        List<PendingObjectUpdate>? immediatelyReady = null;
+        GameSessionData? timeoutState = null;
+        if (activePlayerUpdateIndex >= 0)
         {
-            // Items only seen via PlayerData.VisibleItems still need their own
-            // CMSG_ITEM_QUERY_SINGLE — items already in missingItemTemplates
-            // were dispatched by the loop above.
-            foreach (uint itemId in deferredFor)
+            lock (itemQuerySession.GameState.ItemQueryLock)
             {
-                if (missingItemTemplates.Contains(itemId))
-                    continue;
-                WorldPacket reqPacket = new WorldPacket(Opcode.CMSG_ITEM_QUERY_SINGLE);
-                reqPacket.WriteUInt32(itemId);
-                if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
-                    reqPacket.WriteGuid(WowGuid64.Empty);
-                SendPacketToServer(reqPacket);
+                var playerUpdate = updateObject.ObjectUpdates[activePlayerUpdateIndex];
+                if (itemQuerySession.GameState.DeferredObjectUpdatesByGuid.TryGetValue(playerUpdate.Guid, out var earlierPlayerUpdate))
+                {
+                    if (deferredFor != null)
+                        itemQueryRequests = itemQuerySession.GameState.ItemQueryCoordinator.AddDependencies(earlierPlayerUpdate.Waiter, deferredFor, DateTimeOffset.UtcNow).ToList();
+
+                    earlierPlayerUpdate.UpdateObject.ObjectUpdates.Add(playerUpdate);
+                    updateObject.ObjectUpdates.RemoveAt(activePlayerUpdateIndex);
+                    var laterAuras = auraUpdates.Where(aura => aura.UnitGUID == playerUpdate.Guid).ToList();
+                    auraUpdates.RemoveAll(aura => aura.UnitGUID == playerUpdate.Guid);
+                    earlierPlayerUpdate.AuraUpdates.AddRange(laterAuras);
+                }
+                else if (deferredFor != null && deferredFor.Count > 0)
+                {
+                    var deferredUpdateObject = new UpdateObject(itemQuerySession.GameState);
+                    deferredUpdateObject.ObjectUpdates.Add(playerUpdate);
+                    updateObject.ObjectUpdates.RemoveAt(activePlayerUpdateIndex);
+
+                    var deferredAuras = auraUpdates.Where(aura => aura.UnitGUID == playerUpdate.Guid).ToList();
+                    auraUpdates.RemoveAll(aura => aura.UnitGUID == playerUpdate.Guid);
+                    var now = DateTimeOffset.UtcNow;
+                    var waiter = new ItemQueryWaiter(Interlocked.Increment(ref itemQuerySession.GameState.NextItemQueryWaiterSequence), deferredFor, now);
+                    var pending = new PendingObjectUpdate { UpdateObject = deferredUpdateObject, AuraUpdates = deferredAuras, Waiter = waiter };
+                    Log.Print(LogType.Network, $"[ItemQuery] deferred-enqueue waiter={waiter.Sequence} guid={playerUpdate.Guid} dependencies={string.Join(',', deferredFor)}");
+                    HermesProxy.Server.Telemetry?.Record("item_query_enqueue", "server_to_proxy", nameof(Opcode.SMSG_UPDATE_OBJECT), $"waiter={waiter.Sequence};dependencies={deferredFor.Count}");
+                    itemQuerySession.GameState.DeferredObjectUpdates.TryAdd(waiter, pending);
+                    itemQuerySession.GameState.DeferredObjectUpdatesByGuid.Add(playerUpdate.Guid, pending);
+                    var schedule = itemQuerySession.GameState.ItemQueryCoordinator.Schedule(waiter, now);
+                    itemQueryRequests = schedule.BackendRequests.ToList();
+                    immediatelyReady = [];
+                    foreach (var readyWaiter in schedule.ReadyWaiters)
+                    {
+                        if (itemQuerySession.GameState.DeferredObjectUpdates.TryRemove(readyWaiter, out var ready))
+                            immediatelyReady.Add(ready);
+                    }
+
+                    if (itemQuerySession.GameState.DeferredObjectUpdates.ContainsKey(waiter))
+                        timeoutState = itemQuerySession.GameState;
+                }
             }
-
-            var pending = new PendingObjectUpdate
-            {
-                UpdateObject = updateObject,
-                AuraUpdates = auraUpdates,
-                WaitingForItemIds = deferredFor,
-                EnqueuedAtUtc = DateTimeOffset.UtcNow,
-            };
-            var session = GetSession();
-            lock (session.GameState.DeferredObjectUpdatesLock)
-                session.GameState.DeferredObjectUpdates.Add(pending);
-
-            _ = ReleaseDeferredObjectUpdateAfterTimeoutAsync(pending);
-            return;
         }
+
+        if (itemQueryRequests != null)
+            foreach (uint itemId in itemQueryRequests)
+                SendItemQueryRequest(itemId);
+        if (immediatelyReady != null)
+            foreach (var ready in immediatelyReady)
+                SendDeferredObjectUpdate(itemQuerySession.GameState, ready);
+        if (timeoutState != null)
+            _ = ReleaseDeferredObjectUpdatesAfterTimeoutAsync(timeoutState);
 
         if (updateObject.ObjectUpdates.Count != 0 ||
             updateObject.DestroyedGuids.Count != 0 ||
@@ -403,6 +428,29 @@ public partial class WorldClient
 
         foreach (var auraUpdate in auraUpdates)
             SendPacketToClient(auraUpdate);
+    }
+
+    private void RequestItemTemplateIfNeeded(uint itemId)
+    {
+        if (GetSession().GameState.ItemQueryCoordinator.Request(itemId, DateTimeOffset.UtcNow))
+            SendItemQueryRequest(itemId);
+    }
+
+    private void SendItemQueryRequest(uint itemId)
+    {
+        WorldPacket packet = new WorldPacket(Opcode.CMSG_ITEM_QUERY_SINGLE);
+        packet.WriteUInt32(itemId);
+        if (LegacyVersion.RemovedInVersion(ClientVersionBuild.V2_0_1_6180))
+            packet.WriteGuid(WowGuid64.Empty);
+        ProxyLifecycle? lifecycle = null;
+        if (HermesProxy.Server.MetricsEnabled)
+        {
+            lifecycle = HermesProxy.Server.Metrics.BeginLifecycle(ProxyFlow.ItemQuery.ToString(), (int)Opcode.CMSG_ITEM_QUERY_SINGLE);
+            GetSession().RegisterItemQueryLifecycle(itemId, lifecycle);
+        }
+        SendPacketToServer(packet, lifecycle: lifecycle);
+        Log.Print(LogType.Network, $"[ItemQuery] backend-send item={itemId}");
+        HermesProxy.Server.Telemetry?.Record("item_query_backend_send", "proxy_to_server", nameof(Opcode.CMSG_ITEM_QUERY_SINGLE), $"item={itemId}");
     }
 
     public void ReadNearObjectsBlock(WorldPacket packet, object index)

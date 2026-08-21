@@ -53,8 +53,7 @@ public sealed class PendingObjectUpdate
 {
     public required UpdateObject UpdateObject;
     public required List<AuraUpdate> AuraUpdates;
-    public required HashSet<uint> WaitingForItemIds;
-    public DateTimeOffset EnqueuedAtUtc { get; init; } = DateTimeOffset.UtcNow;
+    public required ItemQueryWaiter Waiter;
 }
 
 // Death Knight rune snapshot. Allocated only for DK players on V3_4_3, where
@@ -152,6 +151,7 @@ public sealed class GameSessionData
     public bool IsInternalCharEnumPending;
     public WowGuid128 CurrentPlayerGuid;
     public long CurrentPlayerCreateTime;
+    public MovementSessionState Movement = new();
     public OwnCharacterInfo? CurrentPlayerInfo;
     public CurrentPlayerStorage CurrentPlayerStorage = null!;
     public uint CurrentGuildCreateTime;
@@ -282,6 +282,7 @@ public sealed class GameSessionData
     // client doesn't have in its world model — those would round-trip as
     // CMSG_OBJECT_UPDATE_FAILED rejections (e.g. Transports we filter at create time).
     public HashSet<WowGuid128> ClientKnownGuids = [];
+    public ObjectUpdateDiagnosticTracker ObjectUpdateDiagnostics = new();
     public Dictionary<WowGuid128, ArenaTeamInspectData[]> PlayerArenaTeams = [];
     public HashSet<string> AddonPrefixes = [];
     public Dictionary<byte, Dictionary<byte, int>> FlatSpellMods = [];
@@ -304,8 +305,14 @@ public sealed class GameSessionData
     // VisibleItems reference item templates not yet cached. Held back until
     // the matching ItemModifiedAppearance hotfixes are emitted, so the modern
     // client renders the player dressed instead of naked. See issue #34.
-    public List<PendingObjectUpdate> DeferredObjectUpdates = [];
-    public Lock DeferredObjectUpdatesLock = new();
+    public readonly ItemQueryCoordinator ItemQueryCoordinator = new(
+        maxCacheEntries: 4096,
+        negativeCacheTtl: TimeSpan.FromSeconds(30),
+        waiterTimeout: DeferredObjectUpdatePolicy.Timeout);
+    public readonly ConcurrentDictionary<ItemQueryWaiter, PendingObjectUpdate> DeferredObjectUpdates = [];
+    public readonly Dictionary<WowGuid128, PendingObjectUpdate> DeferredObjectUpdatesByGuid = [];
+    public readonly Lock ItemQueryLock = new();
+    public long NextItemQueryWaiterSequence;
 
     // Cache of the last SMSG_INIT_WORLD_STATES we sent to the modern client. TC reference
     // re-emits INIT_WORLD_STATES AFTER the player CreateObject (#146 in World_login_parsed.txt),
@@ -1349,10 +1356,12 @@ public class GlobalSessionData
     // CreateObject content against TC's reference parse for the V3_4_3 canary investigation.
     public SniffFile LegacySniff = null!;
 
-    // Modern realm and instance sockets plus the legacy receive loop all mutate
-    // one GameSessionData. This lock gives packet handlers one per-session order.
+    // This lock protects only causal lifecycle-token matching. Packet handlers and
+    // socket I/O deliberately run outside it; each outbound socket owns FIFO delivery.
     public readonly Lock PacketOrderLock = new();
     private readonly Dictionary<ProxyFlow, Queue<ProxyLifecycle>> _pendingProxyLifecycles = [];
+    private readonly Dictionary<uint, Queue<ProxyLifecycle>> _pendingItemQueryLifecycles = [];
+    private int _lifecycleState = (int)SessionLifecycleState.Connecting;
 
     public Dictionary<string, WowGuid128> GuildsByName = [];
     public Dictionary<uint, List<string>> GuildRanks = [];
@@ -1368,6 +1377,8 @@ public class GlobalSessionData
     // Pre-computed read-only struct used on the per-packet LogPacket hot path to avoid
     // an IOptions<T> getter chain on every send/recv.
     public PacketLogContext PacketLogContext { get; }
+    public SessionLifecycleState LifecycleState => (SessionLifecycleState)Volatile.Read(ref _lifecycleState);
+    public bool IsExpectedShutdown => LifecycleState is SessionLifecycleState.LoggingOut or SessionLifecycleState.ClientExited;
 
     public GlobalSessionData(
         ClientOptions clientOptions,
@@ -1423,6 +1434,47 @@ public class GlobalSessionData
 
             return null;
         }
+    }
+
+    public void RegisterItemQueryLifecycle(uint itemId, ProxyLifecycle lifecycle)
+    {
+        lock (PacketOrderLock)
+        {
+            if (!_pendingItemQueryLifecycles.TryGetValue(itemId, out var pending))
+            {
+                pending = new Queue<ProxyLifecycle>();
+                _pendingItemQueryLifecycles.Add(itemId, pending);
+            }
+
+            pending.Enqueue(lifecycle);
+        }
+    }
+
+    public ProxyLifecycle? TakeItemQueryLifecycle(uint itemId)
+    {
+        lock (PacketOrderLock)
+        {
+            return _pendingItemQueryLifecycles.TryGetValue(itemId, out var pending) && pending.TryDequeue(out var lifecycle)
+                ? lifecycle
+                : null;
+        }
+    }
+
+    public void TransitionTo(SessionLifecycleState state)
+    {
+        Volatile.Write(ref _lifecycleState, (int)state);
+    }
+
+    public void MarkExpectedShutdown(string reason)
+    {
+        TransitionTo(SessionLifecycleState.ClientExited);
+        Server.Telemetry?.Record("connection_expected_shutdown", detail: reason);
+    }
+
+    public void MarkFault(string reason)
+    {
+        TransitionTo(SessionLifecycleState.Faulted);
+        Server.Telemetry?.Record("connection_unexpected_disconnect", detail: reason);
     }
     
     public void StoreGuildRankNames(uint guildId, List<string> ranks)
@@ -1511,6 +1563,12 @@ public class GlobalSessionData
             InstanceSocket = null!;
         }
 
+        lock (GameState.ItemQueryLock)
+        {
+            GameState.ItemQueryCoordinator.ResetForReconnect();
+            GameState.DeferredObjectUpdates.Clear();
+            GameState.DeferredObjectUpdatesByGuid.Clear();
+        }
         GameState = GameSessionData.CreateNewGameSessionData(this);
     }
 

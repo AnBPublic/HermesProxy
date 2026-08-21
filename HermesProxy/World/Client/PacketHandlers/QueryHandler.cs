@@ -467,6 +467,19 @@ public partial class WorldClient
     void HandleItemQueryResponse(WorldPacket packet)
     {
         var entry = packet.ReadEntry();
+        var previousLifecycle = _activeLifecycle.Value;
+        if (HermesProxy.Server.MetricsEnabled)
+        {
+            var lifecycle = GetSession().TakeItemQueryLifecycle((uint)entry.Key) ??
+                HermesProxy.Server.Metrics.BeginLifecycle(ProxyFlow.ItemQuery.ToString(), (int)Opcode.SMSG_ITEM_QUERY_SINGLE_RESPONSE);
+            HermesProxy.Server.Metrics.MarkLegacyReceived(lifecycle);
+            _activeLifecycle.Value = lifecycle;
+        }
+
+        try
+        {
+        Log.Print(LogType.Network, $"[ItemQuery] response-arrival item={entry.Key} missing={entry.Value}");
+        HermesProxy.Server.Telemetry?.Record("item_query_response_arrival", "server_to_proxy", nameof(Opcode.SMSG_ITEM_QUERY_SINGLE_RESPONSE), $"item={entry.Key};missing={entry.Value}");
         if (entry.Value)
         {
             if (GetSession().GameState.RequestedItemHotfixes.Contains((uint)entry.Key))
@@ -487,9 +500,7 @@ public partial class WorldClient
                 reply2.Timestamp = (uint)Time.UnixTime;
                 SendPacketToClient(reply2);
             }
-            // issue #34: even an "invalid" answer is an answer — drop this id
-            // from any pending waiting-set so the deferred batch can release.
-            FlushDeferredUpdatesFor((uint)entry.Key);
+            ResolveItemQuery((uint)entry.Key, ItemQueryResolution.Missing);
             return;
         }
 
@@ -499,76 +510,84 @@ public partial class WorldClient
         SendItemUpdatesIfNeeded(item);
         GameData.StoreItemTemplate((uint)entry.Key, item);
 
-        // issue #34: any UpdateObject batch that was held back waiting on this
-        // item template's hotfix can be released now that the DB2 row is in
-        // place on the modern client.
-        FlushDeferredUpdatesFor((uint)entry.Key);
+        ResolveItemQuery((uint)entry.Key, ItemQueryResolution.Found);
+        }
+        finally
+        {
+            _activeLifecycle.Value = previousLifecycle;
+        }
     }
 
-    private void FlushDeferredUpdatesFor(uint resolvedItemId)
+    private void ResolveItemQuery(uint itemId, ItemQueryResolution resolution)
     {
         var session = GetSession();
-        List<PendingObjectUpdate>? toFlush = null;
-        lock (session.GameState.DeferredObjectUpdatesLock)
+        List<PendingObjectUpdate> deferredUpdates = [];
+        lock (session.GameState.ItemQueryLock)
         {
-            var pending = session.GameState.DeferredObjectUpdates;
-            for (int i = 0; i < pending.Count; i++)
+            foreach (var waiter in session.GameState.ItemQueryCoordinator.Resolve(itemId, resolution, DateTimeOffset.UtcNow))
             {
-                var entry = pending[i];
-                entry.WaitingForItemIds.Remove(resolvedItemId);
-                if (entry.WaitingForItemIds.Count == 0)
-                {
-                    toFlush ??= [];
-                    toFlush.Add(entry);
-                }
-            }
-            if (toFlush != null)
-            {
-                foreach (var entry in toFlush)
-                    pending.Remove(entry);
+                if (session.GameState.DeferredObjectUpdates.TryRemove(waiter, out var deferred))
+                    deferredUpdates.Add(deferred);
             }
         }
 
-        if (toFlush == null)
-            return;
-
-        foreach (var entry in toFlush)
-            SendDeferredObjectUpdate(entry);
+        foreach (var deferred in deferredUpdates)
+            SendDeferredObjectUpdate(session.GameState, deferred);
     }
 
-    private async Task ReleaseDeferredObjectUpdateAfterTimeoutAsync(PendingObjectUpdate entry)
+    private async Task ReleaseDeferredObjectUpdatesAfterTimeoutAsync(GameSessionData gameState)
     {
         await Task.Delay(DeferredObjectUpdatePolicy.Timeout);
 
         var session = GetSession();
-        bool released;
-        uint[] unresolvedItemIds;
-        lock (session.GameState.DeferredObjectUpdatesLock)
-        {
-            released = session.GameState.DeferredObjectUpdates.Remove(entry);
-            unresolvedItemIds = entry.WaitingForItemIds.Order().ToArray();
-        }
-
-        if (!released)
+        if (!ReferenceEquals(session.GameState, gameState))
             return;
 
-        Log.Print(LogType.Network,
-            $"[ObjectUpdate] Item query timeout after {DeferredObjectUpdatePolicy.Timeout.TotalMilliseconds:0} ms; " +
-            $"releasing update with unresolved item IDs: {string.Join(",", unresolvedItemIds)}");
-        HermesProxy.Server.Telemetry?.Record(
-            "item_query_timeout",
-            "server_to_client",
-            nameof(Opcode.SMSG_UPDATE_OBJECT),
-            $"unresolvedCount={unresolvedItemIds.Length}");
-        SendDeferredObjectUpdate(entry);
+        List<(PendingObjectUpdate Deferred, uint[] UnresolvedItemIds)> expired = [];
+        lock (gameState.ItemQueryLock)
+        {
+            foreach (var waiter in gameState.ItemQueryCoordinator.Expire(DateTimeOffset.UtcNow))
+            {
+                if (gameState.DeferredObjectUpdates.TryRemove(waiter, out var deferred))
+                    expired.Add((deferred, waiter.PendingItemIds.Order().ToArray()));
+            }
+        }
+
+        foreach (var (deferred, unresolvedItemIds) in expired)
+        {
+            Log.Print(LogType.Network,
+                $"[ObjectUpdate] Item query timeout after {DeferredObjectUpdatePolicy.Timeout.TotalMilliseconds:0} ms; " +
+                $"releasing update with unresolved item IDs: {string.Join(",", unresolvedItemIds)}");
+            HermesProxy.Server.Telemetry?.Record(
+                "item_query_timeout",
+                "server_to_client",
+                nameof(Opcode.SMSG_UPDATE_OBJECT),
+                $"unresolvedCount={unresolvedItemIds.Length}");
+            SendDeferredObjectUpdate(gameState, deferred);
+        }
     }
 
-    private void SendDeferredObjectUpdate(PendingObjectUpdate entry)
+    private void SendDeferredObjectUpdate(GameSessionData gameState, PendingObjectUpdate entry)
     {
+        if (!ReferenceEquals(GetSession().GameState, gameState))
+            return;
+
+        lock (gameState.ItemQueryLock)
+        {
+            if (entry.UpdateObject.ObjectUpdates.Count != 0)
+                gameState.DeferredObjectUpdatesByGuid.Remove(entry.UpdateObject.ObjectUpdates[0].Guid);
+        }
+
+        Log.Print(LogType.Network, $"[ItemQuery] deferred-release waiter={entry.Waiter.Sequence} dependencies={entry.Waiter.ItemIds.Count}");
+        HermesProxy.Server.Telemetry?.Record("item_query_deferred_release", "proxy_to_client", nameof(Opcode.SMSG_UPDATE_OBJECT), $"waiter={entry.Waiter.Sequence};dependencies={entry.Waiter.ItemIds.Count}");
+
         if (entry.UpdateObject.ObjectUpdates.Count != 0 ||
             entry.UpdateObject.DestroyedGuids.Count != 0 ||
             entry.UpdateObject.OutOfRangeGuids.Count != 0)
+        {
+            Log.Print(LogType.Network, $"[ItemQuery] modern-send waiter={entry.Waiter.Sequence} opcode={Opcode.SMSG_UPDATE_OBJECT}");
             SendPacketToClient(entry.UpdateObject);
+        }
 
         foreach (var auraUpdate in entry.AuraUpdates)
             SendPacketToClient(auraUpdate);

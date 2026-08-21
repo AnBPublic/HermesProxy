@@ -36,6 +36,7 @@ Wrathion's listen ports (from its `*.conf` files): BNet `1119`, REST `8081`, Wor
 - Canonical V3_4_3 wire captures for diffing HermesProxy's translated output against ground truth.
 - Reading source for correct packet shapes when WPP and CypherCore disagree.
 - Tiebreaker when fork-diff against `HermesProxy-WOTLK` doesn't settle a wire-format question.
+- Committed offline evidence follows `docs/protocol-fixtures.md`; protocol PRs update the sanitized corpus, and documented-layout fixtures never substitute for known-good 3.4.3 capture goldens.
 
 **Test-loop entry point**: `./test-loop2.ps1 -LocalTc343` (skips proxy lifecycle, launches client via `Wrath - 343.lnk` direct to Wrathion). Wrathion's `bnetserver.exe` + `worldserver.exe` must already be running.
 

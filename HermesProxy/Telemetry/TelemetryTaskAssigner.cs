@@ -83,6 +83,21 @@ public static class TelemetryTaskAssigner
                 Evidence(snapshot, "connection_unexpected_disconnect", "write_failure")));
         }
 
+        var incompleteLifecycles = snapshot.Counters
+            .Where(pair => pair.Key.StartsWith("lifecycle_exercised.", StringComparison.Ordinal) && pair.Value > 0)
+            .Select(pair => pair.Key["lifecycle_exercised.".Length..])
+            .Where(flow => !snapshot.Lifecycles.TryGetValue(flow, out var summary) || summary.Count == 0)
+            .ToArray();
+        if (incompleteLifecycles.Length > 0)
+        {
+            tasks.Add(new AssignedTelemetryTask(
+                "HERMES-WOTLK-LIFECYCLE-TELEMETRY",
+                "P1",
+                "Complete exercised gameplay lifecycle telemetry",
+                "At least one exercised gameplay flow had no completed end-to-end lifecycle sample.",
+                incompleteLifecycles.Select(flow => $"missing-lifecycle:{flow}").ToArray()));
+        }
+
         if (HasAny(snapshot, "movement_unknown"))
         {
             tasks.Add(new AssignedTelemetryTask(

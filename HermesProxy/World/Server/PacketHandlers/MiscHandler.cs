@@ -15,15 +15,9 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_CLOSE_INTERACTION)]
     void HandleCloseInteraction(CloseInteraction closeInteraction)
     {
-        // 3.3.5a exposes the close path as CMSG_QUEST_GIVER_CANCEL (0x190).
-        WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_CANCEL);
-        SendPacketToServer(packet);
-
         var gameState = GetSession().GameState;
-        if (gameState.CurrentInteractedWithNPC == closeInteraction.SourceGuid)
-            gameState.CurrentInteractedWithNPC = default;
-        if (gameState.CurrentInteractedWithGO == closeInteraction.SourceGuid)
-            gameState.CurrentInteractedWithGO = default;
+        if (CloseInteraction.TryBuildLegacyCancel(gameState, closeInteraction.SourceGuid, out var packet))
+            SendPacketToServer(packet);
     }
 
     [PacketHandler(Opcode.CMSG_TIME_SYNC_RESPONSE)]
@@ -255,11 +249,14 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_OBJECT_UPDATE_FAILED)]
     void HandleObjectUpdateFailed(ObjectUpdateFailed fail)
     {
-        Log.Print(LogType.Error, $"Object update failed for {fail.ObjectGuid}.");
+        string correlation = GetSession().GameState.ObjectUpdateDiagnostics?.DescribeFailure(fail.ObjectGuid)
+            ?? $"objectType=Unknown guid={fail.ObjectGuid} guidCategory={fail.ObjectGuid.GetHighType()} updateKind=Unknown serializerSection=Unknown fixture=unmatched";
+        Log.Print(LogType.Error, $"CMSG_OBJECT_UPDATE_FAILED {correlation}");
         HermesProxy.Server.Telemetry?.Record(
             "object_update_failed",
             "client_to_server",
-            nameof(Opcode.CMSG_OBJECT_UPDATE_FAILED));
+            nameof(Opcode.CMSG_OBJECT_UPDATE_FAILED),
+            correlation);
     }
 
     [PacketHandler(Opcode.CMSG_SET_DUNGEON_DIFFICULTY)]

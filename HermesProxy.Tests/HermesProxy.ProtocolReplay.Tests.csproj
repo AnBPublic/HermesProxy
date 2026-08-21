@@ -1,33 +1,33 @@
 <Project Sdk="Microsoft.NET.Sdk">
-
   <PropertyGroup>
+    <BaseIntermediateOutputPath>obj\ProtocolReplay\</BaseIntermediateOutputPath>
+    <BaseOutputPath>bin\ProtocolReplay\</BaseOutputPath>
     <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+    <UseAppHost>true</UseAppHost>
     <Nullable>enable</Nullable>
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <AssemblyName>HermesProxy.ProtocolReplay.Tests</AssemblyName>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit.v3" />
     <PackageReference Include="xunit.runner.visualstudio" />
-    <PackageReference Include="coverlet.collector" />
-    <PackageReference Include="Moq" />
-    <PackageReference Include="Verify.XunitV3" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="**\*.cs" />
+    <Compile Include="ProtocolReplay\*.cs" />
+    <Compile Include="World\ModernOnlyCompatibilityMatrixTests.cs" />
+    <Compile Include="ProtocolReplayTestModuleInitializer.cs" />
     <Content Include="Fixtures\Protocol\**\*.json" CopyToOutputDirectory="PreserveNewest" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Remove="ProtocolReplay\**\*.cs" />
-    <Compile Remove="ProtocolReplayTestModuleInitializer.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\HermesProxy\HermesProxy.csproj" />
     <ProjectReference Include="..\Framework\Framework.csproj" />
   </ItemGroup>
-
 </Project>

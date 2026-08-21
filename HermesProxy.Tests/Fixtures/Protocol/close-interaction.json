@@ -90,5 +90,22 @@
       "semanticFields": { "failure": "empty-source" }
     },
     "evidence": { "kind": "syntheticMalformed", "source": "empty source GUID", "sanitized": true }
+  },
+  {
+    "schemaVersion": 1,
+    "id": "close-interaction-fuzz-all-masks",
+    "flow": "interaction-close",
+    "case": "fuzz",
+    "translation": "modern.close-interaction",
+    "direction": "modernToLegacy",
+    "wireOpcode": "0x3493",
+    "connectionType": "Instance",
+    "backendDialect": "Common",
+    "observedDialects": [ "CMaNGOS", "TrinityCore", "AzerothCore", "Maelstrom" ],
+    "modernBuild": "V3_4_3_54261",
+    "legacyBuild": "V3_3_5a_12340",
+    "sourcePayloadHex": "FFFF",
+    "expected": { "outcome": "rejected", "wireOpcode": "0x0000", "connectionType": "Instance", "payloadHex": "", "semanticFields": { "failure": "fuzz" } },
+    "evidence": { "kind": "deterministicFuzz", "source": "full packed GUID masks without bodies", "sanitized": true }
   }
 ]

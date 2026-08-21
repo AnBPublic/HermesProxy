@@ -177,6 +177,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOGOUT_REQUEST)]
     void HandleLogoutRequest(LogoutRequest logoutRequest)
     {
+        GetSession().TransitionTo(SessionLifecycleState.LoggingOut);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_LOGOUT_REQUEST);
         SendPacketToServer(packet);
     }
@@ -184,6 +185,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_LOGOUT_CANCEL)]
     void HandleLogoutCancel(LogoutCancel logoutCancel)
     {
+        GetSession().TransitionTo(SessionLifecycleState.InWorld);
         WorldPacket packet = new WorldPacket(Opcode.CMSG_LOGOUT_CANCEL);
         SendPacketToServer(packet);
     }

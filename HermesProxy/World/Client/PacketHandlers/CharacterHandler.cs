@@ -249,6 +249,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_LOGIN_VERIFY_WORLD)]
     void HandleLoginVerifyWorld(WorldPacket packet)
     {
+        GetSession().TransitionTo(SessionLifecycleState.InWorld);
         LoginVerifyWorld verify = new LoginVerifyWorld();
         verify.MapID = packet.ReadUInt32();
         GetSession().GameState.CurrentMapId = verify.MapID;
@@ -335,6 +336,7 @@ public partial class WorldClient
     [PacketHandler(Opcode.SMSG_LOGOUT_RESPONSE)]
     void HandleLogoutResponse(WorldPacket packet)
     {
+        GetSession().TransitionTo(SessionLifecycleState.LoggingOut);
         LogoutResponse logout = new LogoutResponse();
         logout.LogoutResult = packet.ReadInt32();
         logout.Instant = packet.ReadBool();
@@ -346,6 +348,7 @@ public partial class WorldClient
     {
         LogoutComplete logout = new LogoutComplete();
         SendPacketToClient(logout);
+        GetSession().MarkExpectedShutdown("logout_complete");
 
         GetSession().GameState = GameSessionData.CreateNewGameSessionData(GetSession());
         GetSession().InstanceSocket.CloseSocket();
