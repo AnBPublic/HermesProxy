@@ -55,6 +55,20 @@ public class CloseInteraction : ClientPacket
             return false;
         }
 
+        // The modern client tracks Gossip and QuestGiver as distinct interaction
+        // types (PlayerInteractionType). Selecting a quest to turn in from the
+        // gossip menu closes the Gossip interaction — firing this same
+        // CMSG_CLOSE_INTERACTION — right before the request-items/reward frame
+        // opens for the same NPC. Forwarding a cancel here would abort the
+        // turn-in server-side before the player can pick a reward. The genuine
+        // "player dismissed that frame" signal is CMSG_QUEST_GIVER_CLOSE_QUEST
+        // instead (see HandleQuestGiverCloseQuest), so swallow this one.
+        if (closesNpc && state.AwaitingQuestGiverRewardFor == sourceGuid)
+        {
+            packet = null!;
+            return false;
+        }
+
         if (closesNpc)
             state.CurrentInteractedWithNPC = default;
         if (closesGameObject)

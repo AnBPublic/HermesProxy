@@ -87,15 +87,24 @@ public partial class WorldSocket
         packet.WriteGuid(hello.QuestGiverGUID.To64());
         SendPacketToServer(packet);
     }
-    // [PacketHandler(Opcode.CMSG_QUEST_GIVER_CLOSE_QUEST)]
-    // void HandleQuestGiverCloseQuest(QuestGiverCloseQuest close)
-    // {
-    //     // Modern client carries QuestID; legacy CMSG_QUEST_GIVER_CANCEL is empty —
-    //     // 3.3.5a just closes whatever NPC interaction the session is currently in.
-    //     _ = close;
-    //     WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_CANCEL);
-    //     SendPacketToServer(packet);
-    // }
+    [PacketHandler(Opcode.CMSG_QUEST_GIVER_CLOSE_QUEST)]
+    void HandleQuestGiverCloseQuest(QuestGiverCloseQuest close)
+    {
+        // Modern client carries QuestID; legacy CMSG_QUEST_GIVER_CANCEL is empty —
+        // 3.3.5a just closes whatever NPC interaction the session is currently in.
+        // This is the genuine "player dismissed the quest detail/reward frame"
+        // signal, distinct from CMSG_CLOSE_INTERACTION (which also fires for the
+        // harmless Gossip->QuestGiver frame transition — see TryBuildLegacyCancel).
+        _ = close;
+        var gameState = GetSession().GameState;
+        gameState.AwaitingQuestGiverRewardFor = default;
+        if (gameState.CurrentInteractedWithNPC == default)
+            return;
+
+        gameState.CurrentInteractedWithNPC = default;
+        WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_CANCEL);
+        SendPacketToServer(packet);
+    }
 
     [PacketHandler(Opcode.CMSG_QUEST_POI_QUERY)]
     void HandleQuestPOIQuery(QuestPOIQuery query)
@@ -123,6 +132,7 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_CHOOSE_REWARD)]
     void HandleQuestGiverChooseReward(QuestGiverChooseReward quest)
     {
+        GetSession().GameState.AwaitingQuestGiverRewardFor = default;
         int choiceIndex = 0;
 
         if (quest.Choice.Item.ItemID != 0)
@@ -160,6 +170,9 @@ public partial class WorldSocket
     [PacketHandler(Opcode.CMSG_QUEST_GIVER_COMPLETE_QUEST)]
     void HandleQuestGiverCompleteQuest(QuestGiverCompleteQuest quest)
     {
+        // Cleared here and re-armed by the client-side handler if the legacy
+        // server responds with another request-items/offer-reward frame.
+        GetSession().GameState.AwaitingQuestGiverRewardFor = default;
         WorldPacket packet = new WorldPacket(Opcode.CMSG_QUEST_GIVER_COMPLETE_QUEST);
         packet.WriteGuid(quest.QuestGiverGUID.To64());
         packet.WriteUInt32(quest.QuestID);

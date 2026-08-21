@@ -158,6 +158,14 @@ public sealed class GameSessionData
     public uint CurrentGuildNumAccounts;
     public WowGuid128 CurrentInteractedWithNPC;
     public WowGuid128 CurrentInteractedWithGO;
+    // Set while a quest-giver request-items/reward frame is on screen for this
+    // NPC (see HandleQuestGiverRequestItems / HandleQuestGiverOfferRewardMessage).
+    // The modern client treats Gossip and QuestGiver as distinct interaction
+    // types and closes the Gossip one (CMSG_CLOSE_INTERACTION) when switching
+    // into the quest completion frame for the same NPC — that close must not
+    // be forwarded as a legacy cancel or the reward frame gets pulled out from
+    // under the player before they can pick a reward. See TryBuildLegacyCancel.
+    public WowGuid128 AwaitingQuestGiverRewardFor;
     // Per-slot QuestID cache used by ReadQuestLogEntry. Legacy 3.3.5a often sends
     // partial Values updates where StateFlags / Progress changes but the QuestID
     // field isn't re-marked dirty. Without this cache, those partial updates

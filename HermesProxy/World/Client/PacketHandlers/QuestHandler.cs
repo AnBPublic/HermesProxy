@@ -258,6 +258,7 @@ public partial class WorldClient
         QuestGiverRequestItems quest = new QuestGiverRequestItems();
         quest.QuestGiverGUID = packet.ReadGuid().To128(GetSession().GameState);
         GetSession().GameState.CurrentInteractedWithNPC = quest.QuestGiverGUID;
+        GetSession().GameState.AwaitingQuestGiverRewardFor = quest.QuestGiverGUID;
         quest.QuestGiverCreatureID = quest.QuestGiverGUID.GetEntry();
         quest.QuestID = packet.ReadUInt32();
         quest.QuestTitle = packet.ReadCString();
@@ -306,6 +307,7 @@ public partial class WorldClient
         QuestGiverOfferRewardMessage quest = new QuestGiverOfferRewardMessage();
         quest.QuestData.QuestGiverGUID = packet.ReadGuid().To128(GetSession().GameState);
         GetSession().GameState.CurrentInteractedWithNPC = quest.QuestData.QuestGiverGUID;
+        GetSession().GameState.AwaitingQuestGiverRewardFor = quest.QuestData.QuestGiverGUID;
         quest.QuestData.QuestGiverCreatureID = quest.QuestData.QuestGiverGUID.GetEntry();
         quest.QuestData.QuestID = packet.ReadUInt32();
         quest.QuestTitle = packet.ReadCString();
