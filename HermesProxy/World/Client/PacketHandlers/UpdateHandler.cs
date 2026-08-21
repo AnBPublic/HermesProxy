@@ -1270,7 +1270,9 @@ public partial class WorldClient
             if (updates.ContainsKey(flagsIndex))
             {
                 ushort flags = (ushort)((updates[flagsIndex].UInt32Value >> ((i % 4) * 8)) & 0xFF);
-                ModernVersion.ConvertAuraFlags(flags, i, out data.Flags, out data.ActiveFlags);
+                ModernVersion.ConvertAuraFlags(flags, i, out var auraFlags, out var activeFlags);
+                data.Flags = auraFlags;
+                data.ActiveFlags = activeFlags;
             }
         }
         else
@@ -1279,7 +1281,9 @@ public partial class WorldClient
             if (updates.ContainsKey(flagsIndex))
             {
                 ushort flags = (ushort)((updates[flagsIndex].UInt32Value >> ((i % 8) * 4)) & 0xF);
-                ModernVersion.ConvertAuraFlags(flags, i, out data.Flags, out data.ActiveFlags);
+                ModernVersion.ConvertAuraFlags(flags, i, out var auraFlags, out var activeFlags);
+                data.Flags = auraFlags;
+                data.ActiveFlags = activeFlags;
             }
         }
 
@@ -1672,7 +1676,7 @@ public partial class WorldClient
                     GetSession().GameState.HunterPetGuids.Add(guid);
 
                 if (objectType == ObjectType.Unit)
-                    GetSession().GameState.StoreCreatureClass(guid.GetEntry(), (Class)updateData.UnitData.ClassId);
+                    GetSession().GameState.StoreCreatureClass(guid, (Class)updateData.UnitData.ClassId);
                 else
                     updateData.PlayerData.ArenaFaction = (byte)(GameData.IsAllianceRace((Race)updateData.UnitData.RaceId) ? 1 : 0);
             }
